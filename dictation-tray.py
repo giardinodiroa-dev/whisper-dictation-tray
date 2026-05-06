@@ -298,45 +298,42 @@ def on_quit():
 # ── Subtitle Overlay ──────────────────────────────────────────────────────────
 
 class SubtitleOverlay(QWidget):
+    _W, _H = 140, 4
+
     def __init__(self):
         super().__init__()
-        self.setWindowFlags(
-            Qt.FramelessWindowHint |
-            Qt.WindowStaysOnTopHint |
-            Qt.Tool
-        )
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setAttribute(Qt.WA_ShowWithoutActivating)  # never steal focus
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        self.label = QLabel("")
-        self.label.setWordWrap(True)
-        self.label.setAlignment(Qt.AlignCenter)
-        self.label.setFont(QFont("Sans", 10))
-        self.label.setStyleSheet(
-            "QLabel { color: white; background: rgba(0,0,0,200); "
-            "border-radius: 8px; padding: 6px 12px; }"
-        )
-        layout.addWidget(self.label)
-
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self._level = 0
+        self._max   = 12
         screen = QApplication.primaryScreen().availableGeometry()
-        self.max_w = min(300, screen.width() - 80)
         self._screen = screen
+        self.setFixedSize(self._W, self._H)
+        self.move(
+            screen.x() + (screen.width() - self._W) // 2,
+            screen.y() + screen.height() - self._H - 8,
+        )
 
     def set_text(self, text):
-        if not text:
+        self._level = text.count("▮") if text else 0
+        if not self._level:
             self.hide()
             return
-        self.label.setText(text)
-        self.label.setFixedWidth(self.max_w)
-        self.adjustSize()
-        x = self._screen.x() + (self._screen.width() - self.width()) // 2
-        y = self._screen.y() + self._screen.height() - self.height() - 60
-        self.move(x, y)
+        self.update()
         if not self.isVisible():
             self.show()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor(0, 0, 0, 100)))
+        p.drawRoundedRect(0, 0, self._W, self._H, 2, 2)
+        fill = int(self._W * self._level / self._max)
+        p.setBrush(QBrush(QColor(220, 50, 50, 210)))
+        p.drawRoundedRect(0, 0, fill, self._H, 2, 2)
+        p.end()
 
 # ── History Panel ─────────────────────────────────────────────────────────────
 
