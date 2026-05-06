@@ -242,10 +242,13 @@ def _output_worker(start_seq):
     """Drains _out_q in submission order regardless of completion order."""
     pending  = {}
     next_seq = start_seq
-    while dictation_active or not _out_q.empty() or pending:
+    while True:
         try:
             seq, raw, formatted, win = _out_q.get(timeout=0.2)
         except queue.Empty:
+            # Exit cleanly when dictation stopped and nothing left to drain
+            if not dictation_active:
+                break
             continue
         pending[seq] = (raw, formatted, win)
         while next_seq in pending:
@@ -274,11 +277,14 @@ def dictation_loop():
     bridge.update_ui.emit("idle", "Dictation OFF — click to start")
 
 def on_toggle():
-    global recording, dictation_active, _parec_proc
+    global recording, dictation_active, _parec_proc, _pending_count
     if dictation_active:
         dictation_active = False
         if _parec_proc:
             _parec_proc.terminate()
+        with _pending_lock:
+            _pending_count = 0
+        bridge.queue_update.emit(0)
         bridge.update_ui.emit("idle", "Dictation OFF — click to start")
         bridge.update_subtitle.emit("")
         return
