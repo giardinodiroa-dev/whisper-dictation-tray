@@ -57,6 +57,20 @@ _parec_proc      = None
 _seq             = 0
 _out_q           = queue.Queue()
 _executor        = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+_pending_count   = 0
+_pending_lock    = threading.Lock()
+
+def _inc_pending():
+    global _pending_count
+    with _pending_lock:
+        _pending_count += 1
+    bridge.queue_update.emit(_pending_count)
+
+def _dec_pending():
+    global _pending_count
+    with _pending_lock:
+        _pending_count = max(0, _pending_count - 1)
+    bridge.queue_update.emit(_pending_count)
 
 # ── Icons ─────────────────────────────────────────────────────────────────────
 
@@ -86,6 +100,7 @@ class Bridge(QObject):
     update_subtitle = pyqtSignal(str)
     type_into_win   = pyqtSignal(str, str)
     add_history     = pyqtSignal(str, str)
+    queue_update    = pyqtSignal(int)
 
 bridge = Bridge()
 
@@ -238,6 +253,7 @@ def _output_worker(start_seq):
             if formatted:
                 bridge.type_into_win.emit(formatted, win or "")
                 bridge.add_history.emit(raw, formatted)
+            _dec_pending()
             next_seq += 1
 
 def dictation_loop():
@@ -250,6 +266,7 @@ def dictation_loop():
         frames, win = _record_one_chunk()
         if frames:
             seq = _seq; _seq += 1
+            _inc_pending()
             _executor.submit(_process_chunk, seq, frames, win)
 
     out_thread.join(timeout=15)
@@ -304,17 +321,23 @@ def on_quit():
 # ── Subtitle Overlay ──────────────────────────────────────────────────────────
 
 class SubtitleOverlay(QWidget):
-    _W, _H = 140, 4
+    _W     = 140
+    _BAR_H = 4
+    _DOT_H = 6
+    _GAP   = 4
+    _H     = _DOT_H + _GAP + _BAR_H   # 14px total
+    _DOT_W = 10
+    _DOT_G = 3
 
     def __init__(self):
         super().__init__()
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
-        self._level = 0
-        self._max   = 12
+        self._level   = 0
+        self._pending = 0
+        self._max     = 12
         screen = QApplication.primaryScreen().availableGeometry()
-        self._screen = screen
         self.setFixedSize(self._W, self._H)
         self.move(
             screen.x() + (screen.width() - self._W) // 2,
@@ -323,7 +346,14 @@ class SubtitleOverlay(QWidget):
 
     def set_text(self, text):
         self._level = text.count("▮") if text else 0
-        if not self._level:
+        self._refresh()
+
+    def set_pending(self, count):
+        self._pending = count
+        self._refresh()
+
+    def _refresh(self):
+        if not self._level and not self._pending:
             self.hide()
             return
         self.update()
@@ -334,11 +364,24 @@ class SubtitleOverlay(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setPen(Qt.NoPen)
+
+        # ── queue dots (green, top row) ───────────────────────────────────────
+        for i in range(self._pending):
+            x = i * (self._DOT_W + self._DOT_G)
+            if x + self._DOT_W > self._W:
+                break
+            p.setBrush(QBrush(QColor(50, 200, 80, 210)))
+            p.drawRoundedRect(x, 0, self._DOT_W, self._DOT_H, 2, 2)
+
+        # ── audio level bar (red, bottom row) ────────────────────────────────
+        bar_y = self._DOT_H + self._GAP
         p.setBrush(QBrush(QColor(0, 0, 0, 100)))
-        p.drawRoundedRect(0, 0, self._W, self._H, 2, 2)
-        fill = int(self._W * self._level / self._max)
-        p.setBrush(QBrush(QColor(220, 50, 50, 210)))
-        p.drawRoundedRect(0, 0, fill, self._H, 2, 2)
+        p.drawRoundedRect(0, bar_y, self._W, self._BAR_H, 2, 2)
+        if self._level:
+            fill = int(self._W * self._level / self._max)
+            p.setBrush(QBrush(QColor(220, 50, 50, 210)))
+            p.drawRoundedRect(0, bar_y, fill, self._BAR_H, 2, 2)
+
         p.end()
 
 # ── History Panel ─────────────────────────────────────────────────────────────
@@ -451,6 +494,7 @@ bridge.update_ui.connect(handle_ui_update)
 bridge.update_subtitle.connect(handle_update_subtitle)
 bridge.type_into_win.connect(handle_type_into_win)
 bridge.add_history.connect(handle_add_history)
+bridge.queue_update.connect(lambda n: subtitle.set_pending(n))
 
 tray = QSystemTrayIcon(QIcon(make_pixmap("idle")), app)
 tray.setToolTip("Dictation OFF — click to start")
