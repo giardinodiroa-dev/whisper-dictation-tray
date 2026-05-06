@@ -242,13 +242,10 @@ def _output_worker(start_seq):
     """Drains _out_q in submission order regardless of completion order."""
     pending  = {}
     next_seq = start_seq
-    while True:
+    while dictation_active or not _out_q.empty() or pending:
         try:
             seq, raw, formatted, win = _out_q.get(timeout=0.2)
         except queue.Empty:
-            # Exit cleanly when dictation stopped and nothing left to drain
-            if not dictation_active:
-                break
             continue
         pending[seq] = (raw, formatted, win)
         while next_seq in pending:
@@ -262,8 +259,7 @@ def _output_worker(start_seq):
 def dictation_loop():
     global recording, dictation_active, _seq
     _seq = 0
-    out_thread = threading.Thread(target=_output_worker, args=(_seq,), daemon=True)
-    out_thread.start()
+    threading.Thread(target=_output_worker, args=(_seq,), daemon=True).start()
 
     while dictation_active:
         frames, win = _record_one_chunk()
@@ -272,7 +268,6 @@ def dictation_loop():
             _inc_pending()
             _executor.submit(_process_chunk, seq, frames, win)
 
-    out_thread.join(timeout=15)
     recording = False
     bridge.update_ui.emit("idle", "Dictation OFF — click to start")
 
