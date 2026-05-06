@@ -14,14 +14,14 @@ Mic (parec) → silence detection → WAV → Groq Whisper → raw transcript
                               xdotool type ← Kilo.ai LLM ← punctuation + caps
 ```
 
-Two free APIs, zero local model downloads:
+One API key, zero local model downloads:
 
 | Stage | Service | Model | Cost |
 |---|---|---|---|
 | Transcription | [Groq](https://console.groq.com) | `whisper-large-v3-turbo` | Free tier: 8 hrs audio/day |
-| Formatting | [Kilo.ai](https://kilo.ai) | `stepfun/step-3.5-flash` | Free, no key needed |
+| Formatting | built-in | — | Free, no key needed |
 
-The LLM formatting step adds punctuation and capitalisation but is explicitly instructed never to change, reorder, or remove a single word — it only cleans up the transcript.
+The formatting step adds punctuation and capitalisation but is explicitly instructed never to change, reorder, or remove a single word — it only cleans up the transcript.
 
 ---
 

@@ -30,9 +30,9 @@ MAX_RECORD_SECS   = 60
 SAMPLE_RATE       = 16000
 GROQ_API_KEY      = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL        = "whisper-large-v3-turbo"
-KILO_HOST         = os.environ.get("KILO_HOST", "api.kilo.ai")
-KILO_PATH         = "/api/openrouter/chat/completions"
-KILO_MODEL        = "stepfun/step-3.5-flash:free"
+_FMT_HOST         = "api.kilo.ai"
+_FMT_PATH         = "/api/openrouter/chat/completions"
+_FMT_MODEL        = "stepfun/step-3.5-flash:free"
 
 CHUNK_SAMPLES  = 1024
 CHUNK_BYTES    = CHUNK_SAMPLES * 2           # s16le = 2 bytes/sample
@@ -89,9 +89,9 @@ def restore_focus(win_id):
     if win_id:
         subprocess.run(["xdotool", "windowfocus", "--sync", win_id], capture_output=True)
 
-def format_with_kilo(raw):
+def _format(raw):
     body = json.dumps({
-        "model": KILO_MODEL,
+        "model": _FMT_MODEL,
         "messages": [
             {"role": "system", "content":
                 "You are a speech-to-text post-processor. Your only job is to add punctuation "
@@ -104,10 +104,10 @@ def format_with_kilo(raw):
         "max_tokens": 2048,
     }).encode()
     ctx  = ssl.create_default_context()
-    conn = http.client.HTTPSConnection(KILO_HOST, context=ctx)
-    conn.request("POST", KILO_PATH, body=body, headers={
+    conn = http.client.HTTPSConnection(_FMT_HOST, context=ctx)
+    conn.request("POST", _FMT_PATH, body=body, headers={
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {os.environ.get('KILO_API_KEY', 'anonymous')}",
+        "Authorization": "Bearer anonymous",
     })
     resp = conn.getresponse()
     data = json.loads(resp.read())
@@ -226,7 +226,7 @@ def dictation_worker():
     if ai_format:
         bridge.update_ui.emit("thinking", "Formatting…")
         try:
-            formatted = format_with_kilo(transcribed)
+            formatted = _format(transcribed)
         except Exception:
             formatted = transcribed
         bridge.type_into_win.emit(formatted, win or "")

@@ -67,10 +67,6 @@ else
     if [[ -n "$GROQ_KEY" ]]; then
         cat > "$ENV_FILE" <<EOF
 GROQ_API_KEY=${GROQ_KEY}
-
-# Kilo.ai free proxy (AI punctuation formatting — no key needed)
-KILO_HOST=api.kilo.ai
-KILO_API_KEY=anonymous
 EOF
         chmod 600 "$ENV_FILE"
         ok ".env created at ~/bin/.env"
