@@ -26,7 +26,8 @@ _load_env(os.path.expanduser("~/bin/.env"))
 SILENCE_SECS      = 2
 SILENCE_THRESHOLD = 400        # RMS floor — raise if too trigger-happy in noisy rooms
 MIN_SPEECH_RMS    = 1500       # peak RMS required to actually send to Groq — blocks static/hallucinations
-MAX_RECORD_SECS   = 60
+MIN_SPEECH_CHUNKS = 8          # ~0.5s of sustained speech required — kills startup pop hallucinations
+MAX_RECORD_SECS   = 120
 SAMPLE_RATE       = 16000
 GROQ_API_KEY      = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL        = "whisper-large-v3-turbo"
@@ -169,6 +170,7 @@ def dictation_worker():
     has_speech    = False
     total_chunks  = 0
     peak_rms      = 0
+    speech_chunks = 0
 
     while dictation_active:
         data = _parec_proc.stdout.read(CHUNK_BYTES)
@@ -185,6 +187,7 @@ def dictation_worker():
         if rms > SILENCE_THRESHOLD:
             has_speech    = True
             silent_chunks = 0
+            speech_chunks += 1
             level = min(int(rms / 300), 12)
             bridge.update_subtitle.emit("▮" * level + "▯" * (12 - level))
         elif has_speech:
@@ -201,7 +204,7 @@ def dictation_worker():
     recording = False
     bridge.update_subtitle.emit("")
 
-    if not has_speech or not frames or peak_rms < MIN_SPEECH_RMS:
+    if not has_speech or not frames or peak_rms < MIN_SPEECH_RMS or speech_chunks < MIN_SPEECH_CHUNKS:
         if dictation_active:
             recording = True
             threading.Thread(target=dictation_worker, daemon=True).start()
