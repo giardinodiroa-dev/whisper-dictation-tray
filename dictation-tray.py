@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import sys, os, subprocess, threading, json, http.client, ssl
-import struct, math, wave, tempfile, uuid
+import struct, math, wave, tempfile, uuid, queue, concurrent.futures
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QAction,
                               QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -54,6 +54,9 @@ dictation_active = False
 recording        = False
 history          = []
 _parec_proc      = None
+_seq             = 0
+_out_q           = queue.Queue()
+_executor        = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 # ── Icons ─────────────────────────────────────────────────────────────────────
 
@@ -151,20 +154,18 @@ def transcribe_with_groq(wav_path):
     conn.close()
     return data.get("text", "").strip()
 
-# ── Dictation worker ──────────────────────────────────────────────────────────
+# ── Parallel dictation engine ─────────────────────────────────────────────────
 
-def dictation_worker():
-    global recording, dictation_active, _parec_proc
-
-    win = get_focused_window()
+def _record_one_chunk():
+    """Records one speech segment. Returns (frames, win) or (None, None)."""
+    global _parec_proc
     env = {**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":0")}
-
     _parec_proc = subprocess.Popen(
         ["parec", f"--rate={SAMPLE_RATE}", "--channels=1",
          "--format=s16le", "--latency-msec=50"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env
     )
-
+    win           = get_focused_window()
     frames        = []
     silent_chunks = 0
     has_speech    = False
@@ -178,74 +179,82 @@ def dictation_worker():
             break
         frames.append(data)
         total_chunks += 1
-
         samples = struct.unpack(f"<{len(data)//2}h", data)
         rms = math.sqrt(sum(s * s for s in samples) / len(samples)) if samples else 0
         if rms > peak_rms:
             peak_rms = rms
-
         if rms > SILENCE_THRESHOLD:
-            has_speech    = True
-            silent_chunks = 0
-            speech_chunks += 1
-            level = min(int(rms / 300), 12)
-            bridge.update_subtitle.emit("▮" * level + "▯" * (12 - level))
+            has_speech = True; silent_chunks = 0; speech_chunks += 1
+            bridge.update_subtitle.emit("▮" * min(int(rms / 300), 12) + "▯" * (12 - min(int(rms / 300), 12)))
         elif has_speech:
             silent_chunks += 1
             if silent_chunks >= SILENCE_CHUNKS:
                 break
-
         if total_chunks >= MAX_CHUNKS:
             break
 
-    _parec_proc.terminate()
-    _parec_proc.wait()
-    _parec_proc = None
-    recording = False
+    _parec_proc.terminate(); _parec_proc.wait(); _parec_proc = None
     bridge.update_subtitle.emit("")
 
-    if not has_speech or not frames or peak_rms < MIN_SPEECH_RMS or speech_chunks < MIN_SPEECH_CHUNKS:
-        if dictation_active:
-            recording = True
-            threading.Thread(target=dictation_worker, daemon=True).start()
-        else:
-            bridge.update_ui.emit("idle", "Dictation OFF — click to start")
-        return
+    valid = has_speech and frames and peak_rms >= MIN_SPEECH_RMS and speech_chunks >= MIN_SPEECH_CHUNKS
+    return (frames, win) if valid else (None, None)
 
-    bridge.update_ui.emit("thinking", "Transcribing…")
-
+def _process_chunk(seq, frames, win):
+    """Transcribe + format one chunk, post result to output queue."""
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     try:
         with wave.open(tmp.name, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
+            wf.setnchannels(1); wf.setsampwidth(2)
             wf.setframerate(SAMPLE_RATE)
             wf.writeframes(b"".join(frames))
-        transcribed = transcribe_with_groq(tmp.name)
+        text = transcribe_with_groq(tmp.name)
     except Exception:
-        transcribed = ""
+        text = ""
     finally:
         os.unlink(tmp.name)
 
-    if not transcribed.strip():
-        if dictation_active:
-            recording = True
-            threading.Thread(target=dictation_worker, daemon=True).start()
-        else:
-            bridge.update_ui.emit("idle", "Dictation OFF — click to start")
-        return
-
-    if ai_format:
-        bridge.update_ui.emit("thinking", "Formatting…")
+    raw = text.strip()
+    formatted = raw
+    if raw and ai_format:
         try:
-            formatted = _format(transcribed)
+            formatted = _format(raw)
         except Exception:
-            formatted = transcribed
-        bridge.type_into_win.emit(formatted, win or "")
-        bridge.add_history.emit(transcribed, formatted)
-    else:
-        bridge.type_into_win.emit(transcribed, win or "")
-        bridge.add_history.emit(transcribed, transcribed)
+            pass
+
+    _out_q.put((seq, raw, formatted, win))
+
+def _output_worker(start_seq):
+    """Drains _out_q in submission order regardless of completion order."""
+    pending  = {}
+    next_seq = start_seq
+    while dictation_active or not _out_q.empty() or pending:
+        try:
+            seq, raw, formatted, win = _out_q.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        pending[seq] = (raw, formatted, win)
+        while next_seq in pending:
+            raw, formatted, win = pending.pop(next_seq)
+            if formatted:
+                bridge.type_into_win.emit(formatted, win or "")
+                bridge.add_history.emit(raw, formatted)
+            next_seq += 1
+
+def dictation_loop():
+    global recording, dictation_active, _seq
+    _seq = 0
+    out_thread = threading.Thread(target=_output_worker, args=(_seq,), daemon=True)
+    out_thread.start()
+
+    while dictation_active:
+        frames, win = _record_one_chunk()
+        if frames:
+            seq = _seq; _seq += 1
+            _executor.submit(_process_chunk, seq, frames, win)
+
+    out_thread.join(timeout=15)
+    recording = False
+    bridge.update_ui.emit("idle", "Dictation OFF — click to start")
 
 def on_toggle():
     global recording, dictation_active, _parec_proc
@@ -260,7 +269,7 @@ def on_toggle():
     if not recording:
         recording = True
         bridge.update_ui.emit("recording", "Listening…")
-        threading.Thread(target=dictation_worker, daemon=True).start()
+        threading.Thread(target=dictation_loop, daemon=True).start()
 
 # ── UI handlers ───────────────────────────────────────────────────────────────
 
@@ -272,18 +281,11 @@ def handle_update_subtitle(text):
     subtitle.set_text(text)
 
 def handle_type_into_win(text, win_id):
-    global recording
     restore_focus(win_id)
     subprocess.run(
         ["xdotool", "type", "--clearmodifiers", "--delay", "0", "--", text],
         capture_output=True
     )
-    if dictation_active:
-        recording = True
-        bridge.update_ui.emit("recording", "Listening…")
-        threading.Thread(target=dictation_worker, daemon=True).start()
-    else:
-        bridge.update_ui.emit("idle", "Dictation OFF — click to start")
 
 def handle_add_history(raw, formatted):
     ts = datetime.now().strftime("%H:%M:%S")
@@ -296,6 +298,7 @@ def on_quit():
     dictation_active = False
     if _parec_proc:
         _parec_proc.terminate()
+    _executor.shutdown(wait=False)
     app.quit()
 
 # ── Subtitle Overlay ──────────────────────────────────────────────────────────
