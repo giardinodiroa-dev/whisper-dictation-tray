@@ -59,6 +59,7 @@ _out_q           = queue.Queue()
 _executor        = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 _pending_count   = 0
 _pending_lock    = threading.Lock()
+_live_rms        = 0   # written by recording thread, read by QTimer in main thread
 
 def _inc_pending():
     global _pending_count
@@ -173,7 +174,7 @@ def transcribe_with_groq(wav_path):
 
 def _record_one_chunk():
     """Records one speech segment. Returns (frames, win) or (None, None)."""
-    global _parec_proc
+    global _parec_proc, _live_rms
     env = {**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":0")}
     _parec_proc = subprocess.Popen(
         ["parec", f"--rate={SAMPLE_RATE}", "--channels=1",
@@ -200,7 +201,7 @@ def _record_one_chunk():
             peak_rms = rms
         if rms > SILENCE_THRESHOLD:
             has_speech = True; silent_chunks = 0; speech_chunks += 1
-            bridge.update_subtitle.emit("▮" * min(int(rms / 300), 12) + "▯" * (12 - min(int(rms / 300), 12)))
+            _live_rms = rms
         elif has_speech:
             silent_chunks += 1
             if silent_chunks >= SILENCE_CHUNKS:
@@ -209,7 +210,7 @@ def _record_one_chunk():
             break
 
     _parec_proc.terminate(); _parec_proc.wait(); _parec_proc = None
-    bridge.update_subtitle.emit("")
+    _live_rms = 0
 
     valid = has_speech and frames and peak_rms >= MIN_SPEECH_RMS and speech_chunks >= MIN_SPEECH_CHUNKS
     return (frames, win) if valid else (None, None)
@@ -296,7 +297,7 @@ def handle_ui_update(state, tooltip):
     tray.setToolTip(tooltip)
 
 def handle_update_subtitle(text):
-    subtitle.set_text(text)
+    pass  # level meter now driven by QTimer — signal kept for compat
 
 def handle_type_into_win(text, win_id):
     restore_focus(win_id)
@@ -326,42 +327,40 @@ class SubtitleOverlay(QWidget):
     _BAR_H = 4
     _DOT_H = 6
     _GAP   = 4
-    _H     = _DOT_H + _GAP + _BAR_H   # 14px total
+    _H     = _DOT_H + _GAP + _BAR_H
     _DOT_W = 10
     _DOT_G = 3
+    _MAX   = 12
 
     def __init__(self):
         super().__init__()
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self._level   = 0
         self._pending = 0
-        self._max     = 12
         screen = QApplication.primaryScreen().availableGeometry()
         self.setFixedSize(self._W, self._H)
         self.move(
             screen.x() + (screen.width() - self._W) // 2,
             screen.y() + screen.height() - self._H - 8,
         )
+        self.show()
 
-    def set_text(self, text):
-        self._level = text.count("▮") if text else 0
-        self._refresh()
+    def tick(self, rms, pending):
+        self._level   = min(int(rms / 300), self._MAX)
+        self._pending = pending
+        self.update()
 
     def set_pending(self, count):
         self._pending = count
-        self._refresh()
-
-    def _refresh(self):
-        if not self._level and not self._pending:
-            self.hide()
-            return
         self.update()
-        if not self.isVisible():
-            self.show()
 
     def paintEvent(self, event):
+        if not self._level and not self._pending:
+            return  # nothing to draw — widget is transparent
+
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setPen(Qt.NoPen)
@@ -379,7 +378,7 @@ class SubtitleOverlay(QWidget):
         p.setBrush(QBrush(QColor(0, 0, 0, 100)))
         p.drawRoundedRect(0, bar_y, self._W, self._BAR_H, 2, 2)
         if self._level:
-            fill = int(self._W * self._level / self._max)
+            fill = int(self._W * self._level / self._MAX)
             p.setBrush(QBrush(QColor(220, 50, 50, 210)))
             p.drawRoundedRect(0, bar_y, fill, self._BAR_H, 2, 2)
 
@@ -495,7 +494,13 @@ bridge.update_ui.connect(handle_ui_update)
 bridge.update_subtitle.connect(handle_update_subtitle)
 bridge.type_into_win.connect(handle_type_into_win)
 bridge.add_history.connect(handle_add_history)
-bridge.queue_update.connect(lambda n: subtitle.set_pending(n))
+bridge.queue_update.connect(subtitle.set_pending)
+
+from PyQt5.QtCore import QTimer
+_level_timer = QTimer()
+_level_timer.setInterval(80)
+_level_timer.timeout.connect(lambda: subtitle.tick(_live_rms, _pending_count))
+_level_timer.start()
 
 tray = QSystemTrayIcon(QIcon(make_pixmap("idle")), app)
 tray.setToolTip("Dictation OFF — click to start")
