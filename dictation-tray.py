@@ -78,7 +78,6 @@ dictation_active = False
 recording        = False
 _focus_watcher_stop  = threading.Event()
 _last_focused_win    = None
-_last_desktop        = None
 def _load_history():
     try:
         with open(HIST_PATH) as f: return json.load(f)
@@ -625,46 +624,37 @@ class FocusFlash(QWidget):
         p.end()
 
 def _focus_watcher():
-    global _last_focused_win, _last_desktop
+    global _last_focused_win
     while not _focus_watcher_stop.is_set():
         try:
             r = subprocess.run(["xdotool", "getactivewindow"],
                                capture_output=True, text=True, timeout=1)
             win = r.stdout.strip()
-            rd = subprocess.run(["xdotool", "get_desktop"],
-                                capture_output=True, text=True, timeout=1)
-            desk = rd.stdout.strip()
             if win and win != _last_focused_win:
-                if desk == _last_desktop:  # same desktop = user clicked, not a desktop switch
-                    r2 = subprocess.run(
-                        ["xdotool", "getwindowgeometry", "--shell", win],
-                        capture_output=True, text=True, timeout=1)
-                    geo = {}
-                    for line in r2.stdout.splitlines():
-                        if '=' in line:
-                            k, v = line.split('=', 1)
-                            try: geo[k] = int(v)
-                            except ValueError: pass
-                    if all(k in geo for k in ('X', 'Y', 'WIDTH', 'HEIGHT')):
-                        bridge.focus_flash.emit(geo['X'], geo['Y'], geo['WIDTH'], geo['HEIGHT'])
                 _last_focused_win = win
-            _last_desktop = desk
+                r2 = subprocess.run(
+                    ["xdotool", "getwindowgeometry", "--shell", win],
+                    capture_output=True, text=True, timeout=1)
+                geo = {}
+                for line in r2.stdout.splitlines():
+                    if '=' in line:
+                        k, v = line.split('=', 1)
+                        try: geo[k] = int(v)
+                        except ValueError: pass
+                if all(k in geo for k in ('X', 'Y', 'WIDTH', 'HEIGHT')):
+                    bridge.focus_flash.emit(geo['X'], geo['Y'], geo['WIDTH'], geo['HEIGHT'])
         except Exception:
             pass
         time.sleep(0.25)
 
 def _start_focus_watcher():
-    global _last_focused_win, _last_desktop
+    global _last_focused_win
     try:
         _last_focused_win = subprocess.run(
             ["xdotool", "getactivewindow"], capture_output=True, text=True, timeout=1
         ).stdout.strip()
-        _last_desktop = subprocess.run(
-            ["xdotool", "get_desktop"], capture_output=True, text=True, timeout=1
-        ).stdout.strip()
     except Exception:
         _last_focused_win = None
-        _last_desktop = None
     _focus_watcher_stop.clear()
     threading.Thread(target=_focus_watcher, daemon=True).start()
 
