@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import sys, os, subprocess, threading, json, http.client, ssl, logging
-import struct, math, wave, tempfile, uuid, queue, concurrent.futures
+import struct, math, wave, tempfile, uuid, queue, concurrent.futures, time
 from datetime import datetime
 
 # ── Recordings + log paths ────────────────────────────────────────────────────
@@ -70,11 +70,14 @@ CHUNK_BYTES    = CHUNK_SAMPLES * 2           # s16le = 2 bytes/sample
 SILENCE_CHUNKS = int(SAMPLE_RATE / CHUNK_SAMPLES * SILENCE_SECS)
 MAX_CHUNKS     = int(SAMPLE_RATE / CHUNK_SAMPLES * MAX_RECORD_SECS)
 
-ai_format            = False
+ai_format             = False
 filter_hallucinations = True
-restore_focus_on     = True   # when True, view auto-jumps to the window receiving text
+restore_focus_on      = True   # when True, view auto-jumps to the window receiving text
+focus_flash_always    = False  # True = flash on focus change even outside dictation
 dictation_active = False
 recording        = False
+_focus_watcher_stop  = threading.Event()
+_last_focused_win    = None
 def _load_history():
     try:
         with open(HIST_PATH) as f: return json.load(f)
@@ -138,6 +141,7 @@ class Bridge(QObject):
     mini_show       = pyqtSignal(int, int, bytes) # desktop, num_desktops, png_bytes
     mini_countdown  = pyqtSignal(int)             # 3,2,1 — 0 means clear count
     mini_hide       = pyqtSignal()
+    focus_flash     = pyqtSignal(int, int, int, int)  # x, y, w, h
 
 bridge = Bridge()
 
@@ -382,12 +386,16 @@ def on_toggle():
         bridge.queue_update.emit(0)
         bridge.update_ui.emit("idle", "Dictation OFF — click to start")
         bridge.update_subtitle.emit("")
+        if not focus_flash_always:
+            _stop_focus_watcher()
         return
     dictation_active = True
     if not recording:
         recording = True
         bridge.update_ui.emit("recording", "Listening…")
         threading.Thread(target=dictation_loop, daemon=True).start()
+    if not focus_flash_always:
+        _start_focus_watcher()
 
 # ── UI handlers ───────────────────────────────────────────────────────────────
 
@@ -570,6 +578,81 @@ class SubtitleOverlay(QWidget):
             p.drawRoundedRect(0, bar_y, fill, self._BAR_H, 2, 2)
 
         p.end()
+
+# ── Focus Flash ───────────────────────────────────────────────────────────────
+
+class FocusFlash(QWidget):
+    _FPS      = 60
+    _DURATION = 400   # ms total fade
+    _STEPS    = _FPS * _DURATION // 1000
+    _START_A  = 70    # starting alpha (~27% opacity)
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.FramelessWindowHint |
+            Qt.WindowStaysOnTopHint |
+            Qt.X11BypassWindowManagerHint
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._alpha = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000 // self._FPS)
+        self._timer.timeout.connect(self._tick)
+        self.hide()
+
+    def flash(self, x, y, w, h):
+        self.setGeometry(x, y, w, h)
+        self._alpha = self._START_A
+        self.show()
+        self._timer.start()
+        self.update()
+
+    def _tick(self):
+        self._alpha -= self._START_A / self._STEPS
+        if self._alpha <= 0:
+            self._alpha = 0
+            self._timer.stop()
+            self.hide()
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(100, 160, 255, int(self._alpha)))
+        p.end()
+
+def _focus_watcher():
+    global _last_focused_win
+    while not _focus_watcher_stop.is_set():
+        try:
+            r = subprocess.run(["xdotool", "getactivewindow"],
+                               capture_output=True, text=True, timeout=1)
+            win = r.stdout.strip()
+            if win and win != _last_focused_win:
+                _last_focused_win = win
+                r2 = subprocess.run(
+                    ["xdotool", "getwindowgeometry", "--shell", win],
+                    capture_output=True, text=True, timeout=1)
+                geo = {}
+                for line in r2.stdout.splitlines():
+                    if '=' in line:
+                        k, v = line.split('=', 1)
+                        try: geo[k] = int(v)
+                        except ValueError: pass
+                if all(k in geo for k in ('X', 'Y', 'WIDTH', 'HEIGHT')):
+                    bridge.focus_flash.emit(geo['X'], geo['Y'], geo['WIDTH'], geo['HEIGHT'])
+        except Exception:
+            pass
+        time.sleep(0.25)
+
+def _start_focus_watcher():
+    _focus_watcher_stop.clear()
+    threading.Thread(target=_focus_watcher, daemon=True).start()
+
+def _stop_focus_watcher():
+    _focus_watcher_stop.set()
 
 # ── History Panel ─────────────────────────────────────────────────────────────
 
@@ -833,9 +916,10 @@ class HistoryPanel(QWidget):
 app = QApplication(sys.argv)
 app.setQuitOnLastWindowClosed(False)
 
-subtitle   = SubtitleOverlay()
-hist_panel = HistoryPanel()
-mini       = WindowMiniature()
+subtitle    = SubtitleOverlay()
+hist_panel  = HistoryPanel()
+mini        = WindowMiniature()
+focus_flash = FocusFlash()
 
 bridge.update_ui.connect(handle_ui_update)
 bridge.update_subtitle.connect(handle_update_subtitle)
@@ -867,6 +951,7 @@ def _handle_mini_hide():
         mini.show_for(desktop, num_desktops, thumb)
 
 bridge.mini_show.connect(_handle_mini_show)
+bridge.focus_flash.connect(lambda x, y, w, h: focus_flash.flash(x, y, w, h))
 bridge.mini_countdown.connect(mini.set_countdown)
 bridge.mini_hide.connect(_handle_mini_hide)
 
@@ -887,6 +972,14 @@ def toggle_hallucination_filter():
     global filter_hallucinations
     filter_hallucinations = not filter_hallucinations
 
+def toggle_focus_flash_always():
+    global focus_flash_always
+    focus_flash_always = not focus_flash_always
+    if focus_flash_always:
+        _start_focus_watcher()
+    elif not dictation_active:
+        _stop_focus_watcher()
+
 menu = QMenu()
 
 def _rebuild_menu():
@@ -899,6 +992,9 @@ def _rebuild_menu():
     hal = menu.addAction("Filter Thank Yous")
     hal.setCheckable(True); hal.setChecked(filter_hallucinations)
     hal.triggered.connect(toggle_hallucination_filter)
+    ffa = menu.addAction("Focus Flash Always")
+    ffa.setCheckable(True); ffa.setChecked(focus_flash_always)
+    ffa.triggered.connect(toggle_focus_flash_always)
     rf = menu.addAction("Restore Focus After Typing")
     rf.setCheckable(True); rf.setChecked(restore_focus_on)
     def _toggle_rf():
