@@ -654,6 +654,17 @@ def _focus_watcher():
         time.sleep(0.25)
 
 def _start_focus_watcher():
+    global _last_focused_win, _last_desktop
+    try:
+        _last_focused_win = subprocess.run(
+            ["xdotool", "getactivewindow"], capture_output=True, text=True, timeout=1
+        ).stdout.strip()
+        _last_desktop = subprocess.run(
+            ["xdotool", "get_desktop"], capture_output=True, text=True, timeout=1
+        ).stdout.strip()
+    except Exception:
+        _last_focused_win = None
+        _last_desktop = None
     _focus_watcher_stop.clear()
     threading.Thread(target=_focus_watcher, daemon=True).start()
 
