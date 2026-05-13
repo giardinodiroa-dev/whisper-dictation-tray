@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, os, subprocess, threading, json, http.client, ssl, logging
+import sys, os, signal, subprocess, threading, json, http.client, ssl, logging
 import struct, math, wave, tempfile, uuid, queue, concurrent.futures
 from datetime import datetime
 
@@ -926,5 +926,11 @@ _rebuild_menu()  # initial build so the menu is valid before first show
 tray.setContextMenu(menu)
 tray.activated.connect(lambda r: on_toggle() if r == QSystemTrayIcon.Trigger else None)
 tray.show()
+
+# ── SIGUSR1 → toggle dictation (triggered by xbindkeys) ──────────────────────
+def _on_sigusr1(signum, frame):
+    QTimer.singleShot(0, on_toggle)
+
+signal.signal(signal.SIGUSR1, _on_sigusr1)
 
 sys.exit(app.exec_())
