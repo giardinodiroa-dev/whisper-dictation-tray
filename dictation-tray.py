@@ -623,16 +623,22 @@ class FocusFlash(QWidget):
         p.end()
 
 def _focus_watcher():
+    last_desktop_change = 0.0
     proc = subprocess.Popen(
-        ["xprop", "-spy", "-root", "_NET_ACTIVE_WINDOW"],
+        ["xprop", "-spy", "-root", "_NET_ACTIVE_WINDOW", "_NET_CURRENT_DESKTOP"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
     )
     try:
         for line in proc.stdout:
             if _focus_watcher_stop.is_set():
                 break
-            # line: _NET_ACTIVE_WINDOW(WINDOW): window id # 0x1234567
+            if "_NET_CURRENT_DESKTOP" in line:
+                last_desktop_change = time.time()
+                continue
             if "window id #" not in line:
+                continue
+            # suppress if a desktop switch happened within the last 150ms
+            if time.time() - last_desktop_change < 0.15:
                 continue
             try:
                 win_hex = line.split("window id #")[-1].strip()
