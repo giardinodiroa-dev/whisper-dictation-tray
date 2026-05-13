@@ -45,6 +45,14 @@ GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL          = "whisper-large-v3-turbo"
 NO_SPEECH_THRESHOLD = 0.6   # discard if Whisper's avg no_speech_prob exceeds this
 
+HALLUCINATION_EXACT = {
+    "thank you", "thank you.", "thanks", "thanks.",
+    "thank you so much", "thank you so much.",
+    "thank you very much", "thank you very much.",
+    "thanks for watching", "thanks for watching.",
+    "thank you for watching", "thank you for watching.",
+}
+
 import base64 as _b64
 _K  = b"vxtray9q"
 _H  = "FwgdXAoQVR5YGR0="
@@ -62,8 +70,9 @@ CHUNK_BYTES    = CHUNK_SAMPLES * 2           # s16le = 2 bytes/sample
 SILENCE_CHUNKS = int(SAMPLE_RATE / CHUNK_SAMPLES * SILENCE_SECS)
 MAX_CHUNKS     = int(SAMPLE_RATE / CHUNK_SAMPLES * MAX_RECORD_SECS)
 
-ai_format        = True
-restore_focus_on = True   # when True, view auto-jumps to the window receiving text
+ai_format            = False
+filter_hallucinations = True
+restore_focus_on     = True   # when True, view auto-jumps to the window receiving text
 dictation_active = False
 recording        = False
 def _load_history():
@@ -204,7 +213,11 @@ def transcribe_with_groq(wav_path):
         if avg_no_speech >= NO_SPEECH_THRESHOLD:
             log.info(f"discarded: no_speech_prob={avg_no_speech:.2f}")
             return ""
-    return data.get("text", "").strip()
+    text = data.get("text", "").strip()
+    if filter_hallucinations and text.lower() in HALLUCINATION_EXACT:
+        log.info(f"discarded hallucination: {text!r}")
+        return ""
+    return text
 
 # ── Parallel dictation engine ─────────────────────────────────────────────────
 
@@ -869,7 +882,10 @@ tray.setToolTip("Dictation OFF — click to start")
 def toggle_ai():
     global ai_format
     ai_format = not ai_format
-    # Checkbox state refreshes next time the menu opens (see _rebuild_menu).
+
+def toggle_hallucination_filter():
+    global filter_hallucinations
+    filter_hallucinations = not filter_hallucinations
 
 menu = QMenu()
 
@@ -880,6 +896,9 @@ def _rebuild_menu():
     fmt = menu.addAction("AI Formatting")
     fmt.setCheckable(True); fmt.setChecked(ai_format)
     fmt.triggered.connect(toggle_ai)
+    hal = menu.addAction("Filter Thank Yous")
+    hal.setCheckable(True); hal.setChecked(filter_hallucinations)
+    hal.triggered.connect(toggle_hallucination_filter)
     rf = menu.addAction("Restore Focus After Typing")
     rf.setCheckable(True); rf.setChecked(restore_focus_on)
     def _toggle_rf():
