@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QAction,
                               QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                               QScrollArea, QFrame, QPushButton, QSizePolicy)
 from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor, QBrush, QPen, QFont
-from PyQt5.QtCore import Qt, QObject, pyqtSignal, QRect
+from PyQt5.QtCore import Qt, QObject, pyqtSignal, QRect, QTimer
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -78,6 +78,7 @@ dictation_active = False
 recording        = False
 _focus_watcher_stop  = threading.Event()
 _last_focused_win    = None
+_last_desktop        = None
 def _load_history():
     try:
         with open(HIST_PATH) as f: return json.load(f)
@@ -624,25 +625,30 @@ class FocusFlash(QWidget):
         p.end()
 
 def _focus_watcher():
-    global _last_focused_win
+    global _last_focused_win, _last_desktop
     while not _focus_watcher_stop.is_set():
         try:
             r = subprocess.run(["xdotool", "getactivewindow"],
                                capture_output=True, text=True, timeout=1)
             win = r.stdout.strip()
+            rd = subprocess.run(["xdotool", "get_desktop"],
+                                capture_output=True, text=True, timeout=1)
+            desk = rd.stdout.strip()
             if win and win != _last_focused_win:
+                if desk == _last_desktop:  # same desktop = user clicked, not a desktop switch
+                    r2 = subprocess.run(
+                        ["xdotool", "getwindowgeometry", "--shell", win],
+                        capture_output=True, text=True, timeout=1)
+                    geo = {}
+                    for line in r2.stdout.splitlines():
+                        if '=' in line:
+                            k, v = line.split('=', 1)
+                            try: geo[k] = int(v)
+                            except ValueError: pass
+                    if all(k in geo for k in ('X', 'Y', 'WIDTH', 'HEIGHT')):
+                        bridge.focus_flash.emit(geo['X'], geo['Y'], geo['WIDTH'], geo['HEIGHT'])
                 _last_focused_win = win
-                r2 = subprocess.run(
-                    ["xdotool", "getwindowgeometry", "--shell", win],
-                    capture_output=True, text=True, timeout=1)
-                geo = {}
-                for line in r2.stdout.splitlines():
-                    if '=' in line:
-                        k, v = line.split('=', 1)
-                        try: geo[k] = int(v)
-                        except ValueError: pass
-                if all(k in geo for k in ('X', 'Y', 'WIDTH', 'HEIGHT')):
-                    bridge.focus_flash.emit(geo['X'], geo['Y'], geo['WIDTH'], geo['HEIGHT'])
+            _last_desktop = desk
         except Exception:
             pass
         time.sleep(0.25)
