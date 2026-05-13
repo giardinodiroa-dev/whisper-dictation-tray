@@ -99,11 +99,45 @@ voice   # alias: kills any existing instance and restarts
 
 ---
 
+## Global hotkey (xbindkeys)
+
+The tray process responds to `SIGUSR1` to toggle dictation from any window — no click required.
+
+**1. Install xbindkeys**
+
+```bash
+# Arch
+sudo pacman -S xbindkeys
+
+# Ubuntu / Debian
+sudo apt install xbindkeys
+```
+
+**2. Add a binding to `~/.xbindkeysrc`**
+
+```
+"pkill -USR1 -f dictation-tray.py"
+  Mod4+Alt+space
+```
+
+`Mod4` is the Super/Windows key. Change the key combo to whatever you prefer.
+
+**3. Reload xbindkeys**
+
+```bash
+pkill -x xbindkeys; xbindkeys
+```
+
+To autostart xbindkeys on login, add it to your `~/.config/autostart/` or session startup script.
+
+---
+
 ## Usage
 
 | Action | Result |
 |---|---|
 | Left-click tray icon | Toggle listening on/off |
+| **Super+Alt+Space** (xbindkeys) | Toggle listening on/off from any window |
 | Right-click → **AI Formatting** | Toggle punctuation pass (on by default) |
 | Right-click → **Show History** | Session history with copy buttons |
 | Right-click → **Quit** | Exit |
