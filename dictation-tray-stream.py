@@ -4,10 +4,11 @@ import struct, math, wave, tempfile, uuid, queue, concurrent.futures
 from datetime import datetime
 
 # ── Recordings + log paths ────────────────────────────────────────────────────
-DICT_DIR  = os.path.expanduser("~/.local/share/dictation")
-AUDIO_DIR = os.path.join(DICT_DIR, "recordings")
-LOG_PATH  = os.path.join(DICT_DIR, "dictation.log")
-HIST_PATH = os.path.join(DICT_DIR, "history.json")
+DICT_DIR      = os.path.expanduser("~/.local/share/dictation")
+AUDIO_DIR     = os.path.join(DICT_DIR, "recordings")
+LOG_PATH      = os.path.join(DICT_DIR, "dictation.log")
+HIST_PATH     = os.path.join(DICT_DIR, "history.json")
+SETTINGS_PATH = os.path.join(DICT_DIR, "stream-settings.json")
 os.makedirs(AUDIO_DIR, exist_ok=True)
 logging.basicConfig(
     filename=LOG_PATH, level=logging.INFO,
@@ -16,9 +17,10 @@ logging.basicConfig(
 log = logging.getLogger("dictation")
 from PyQt5.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QAction,
                               QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-                              QScrollArea, QFrame, QPushButton, QSizePolicy)
-from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor, QBrush, QPen, QFont
-from PyQt5.QtCore import Qt, QObject, pyqtSignal, QRect, QTimer
+                              QScrollArea, QFrame, QPushButton, QSizePolicy,
+                              QDoubleSpinBox, QDialog)
+from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor, QBrush, QPen, QFont, QPolygonF
+from PyQt5.QtCore import Qt, QObject, pyqtSignal, QRect, QTimer, QPointF
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -44,6 +46,7 @@ SAMPLE_RATE         = 16000
 GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL          = "whisper-large-v3-turbo"
 NO_SPEECH_THRESHOLD = 0.6   # discard if Whisper's avg no_speech_prob exceeds this
+HISTORY_GROUP_SECS  = 5.0   # chunks to the same window within this gap share one history card
 
 HALLUCINATION_EXACT = {
     "thank you", "thank you.", "thanks", "thanks.",
@@ -70,9 +73,9 @@ CHUNK_BYTES    = CHUNK_SAMPLES * 2           # s16le = 2 bytes/sample
 SILENCE_CHUNKS = int(SAMPLE_RATE / CHUNK_SAMPLES * SILENCE_SECS)
 MAX_CHUNKS     = int(SAMPLE_RATE / CHUNK_SAMPLES * MAX_RECORD_SECS)
 
-STREAM_MIN_SPEECH_SECS   = 2.0   # minimum speech before a flush is eligible
-STREAM_FORCE_FLUSH_SECS  = 4.0   # force flush regardless of silence at this duration
-STREAM_SILENCE_FLUSH_SECS = 0.5  # silence duration that triggers a flush (after min speech)
+STREAM_MIN_SPEECH_SECS   = 0.5   # minimum speech before a flush is eligible
+STREAM_FORCE_FLUSH_SECS  = 1.0   # force flush regardless of silence at this duration
+STREAM_SILENCE_FLUSH_SECS = 0.3  # silence duration that triggers a flush (after min speech)
 STREAM_MIN_SPEECH_CHUNKS  = int(SAMPLE_RATE / CHUNK_SAMPLES * STREAM_MIN_SPEECH_SECS)
 STREAM_FORCE_CHUNKS       = int(SAMPLE_RATE / CHUNK_SAMPLES * STREAM_FORCE_FLUSH_SECS)
 STREAM_SILENCE_CHUNKS     = int(SAMPLE_RATE / CHUNK_SAMPLES * STREAM_SILENCE_FLUSH_SECS)
@@ -80,23 +83,59 @@ STREAM_SILENCE_CHUNKS     = int(SAMPLE_RATE / CHUNK_SAMPLES * STREAM_SILENCE_FLU
 ai_format             = False
 filter_hallucinations = True
 restore_focus_on      = True   # when True, view auto-jumps to the window receiving text
-dictation_active = False
-recording        = False
+mini_enabled          = True   # when False, window preview miniature is suppressed
+hide_mini_on_switch   = True   # hide preview when user switches to a different virtual desktop
+dictation_active    = False
+recording           = False
 def _load_history():
     try:
         with open(HIST_PATH) as f: return json.load(f)
     except Exception: return []
+
+def _load_settings():
+    global STREAM_FORCE_FLUSH_SECS, STREAM_MIN_SPEECH_SECS, STREAM_SILENCE_FLUSH_SECS
+    global STREAM_FORCE_CHUNKS, STREAM_MIN_SPEECH_CHUNKS, STREAM_SILENCE_CHUNKS
+    try:
+        with open(SETTINGS_PATH) as f:
+            s = json.load(f)
+        STREAM_FORCE_FLUSH_SECS   = float(s.get("force",   STREAM_FORCE_FLUSH_SECS))
+        STREAM_MIN_SPEECH_SECS    = float(s.get("min",     STREAM_MIN_SPEECH_SECS))
+        STREAM_SILENCE_FLUSH_SECS = float(s.get("silence", STREAM_SILENCE_FLUSH_SECS))
+        STREAM_FORCE_CHUNKS       = int(SAMPLE_RATE / CHUNK_SAMPLES * STREAM_FORCE_FLUSH_SECS)
+        STREAM_MIN_SPEECH_CHUNKS  = int(SAMPLE_RATE / CHUNK_SAMPLES * STREAM_MIN_SPEECH_SECS)
+        STREAM_SILENCE_CHUNKS     = int(SAMPLE_RATE / CHUNK_SAMPLES * STREAM_SILENCE_FLUSH_SECS)
+    except Exception:
+        pass
+
+def _save_settings():
+    try:
+        with open(SETTINGS_PATH, "w") as f:
+            json.dump({
+                "force":   STREAM_FORCE_FLUSH_SECS,
+                "min":     STREAM_MIN_SPEECH_SECS,
+                "silence": STREAM_SILENCE_FLUSH_SECS,
+            }, f)
+    except Exception as e:
+        log.error(f"settings save error: {e}")
+
+_load_settings()  # apply saved values over defaults at startup
+
+_history_dirty = False
 
 def _save_history():
     try:
         with open(HIST_PATH, "w") as f: json.dump(history, f)
     except Exception as e: log.error(f"history save error: {e}")
 
+def _mark_history_dirty():
+    global _history_dirty
+    _history_dirty = True
+
 history          = _load_history()
 _parec_proc      = None
 _seq             = 0
 _out_q           = queue.Queue()
-_executor        = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+_executor        = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 _pending_count   = 0
 _pending_lock    = threading.Lock()
 _live_rms        = 0   # written by recording thread, read by QTimer in main thread
@@ -116,21 +155,45 @@ def _dec_pending():
 # ── Icons ─────────────────────────────────────────────────────────────────────
 
 def make_pixmap(state):
-    colors = {"idle": QColor(90,90,90), "recording": QColor(220,50,50), "thinking": QColor(50,140,220)}
+    TEAL = QColor(0, 255, 212)
     px = QPixmap(64, 64)
     px.fill(Qt.transparent)
     p = QPainter(px)
     p.setRenderHint(QPainter.Antialiasing)
-    p.setBrush(QBrush(colors.get(state, colors["idle"])))
-    p.setPen(Qt.NoPen)
-    p.drawEllipse(4, 4, 56, 56)
-    p.setBrush(QBrush(QColor("white")))
-    p.drawRoundedRect(22, 12, 20, 28, 10, 10)
-    p.setPen(QPen(QColor("white"), 3))
-    p.setBrush(Qt.NoBrush)
-    p.drawArc(QRect(16, 30, 32, 20), 0, 180 * 16)
-    p.drawLine(32, 50, 32, 58)
-    p.drawLine(24, 58, 40, 58)
+    cy = 32
+    xs    = [13, 22, 32, 42, 51]
+    halfh = [8,  14, 22, 14,  8]
+    halfw = [3,   5,  8,  5,  3]
+    if state == "idle":
+        # Hollow: circle outline only, wave outline only
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(TEAL, 2))
+        p.drawEllipse(5, 5, 54, 54)
+        for x, hh, hw in zip(xs, halfh, halfw):
+            pts = QPolygonF([
+                QPointF(x,      cy - hh),
+                QPointF(x + hw, cy),
+                QPointF(x,      cy + hh),
+                QPointF(x - hw, cy),
+            ])
+            p.drawPolygon(pts)
+    else:
+        color = TEAL if state == "recording" else QColor(50, 140, 220)
+        # Filled circle
+        p.setBrush(QBrush(color))
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(4, 4, 56, 56)
+        # Black filled wave
+        p.setBrush(QBrush(QColor(0, 0, 0)))
+        p.setPen(Qt.NoPen)
+        for x, hh, hw in zip(xs, halfh, halfw):
+            pts = QPolygonF([
+                QPointF(x,      cy - hh),
+                QPointF(x + hw, cy),
+                QPointF(x,      cy + hh),
+                QPointF(x - hw, cy),
+            ])
+            p.drawPolygon(pts)
     p.end()
     return px
 
@@ -140,7 +203,7 @@ class Bridge(QObject):
     update_ui       = pyqtSignal(str, str)
     update_subtitle = pyqtSignal(str)
     type_into_win   = pyqtSignal(str, str)
-    add_history     = pyqtSignal(str, str)
+    add_history     = pyqtSignal(str, str, str)  # raw, formatted, win
     queue_update    = pyqtSignal(int)
     mini_show       = pyqtSignal(int, int, bytes) # desktop, num_desktops, png_bytes
     mini_countdown  = pyqtSignal(int)             # 3,2,1 — 0 means clear count
@@ -189,49 +252,55 @@ def _format(raw):
     conn.close()
     return data["choices"][0]["message"]["content"].strip()
 
-def transcribe_with_groq(wav_path):
-    boundary = uuid.uuid4().hex
+def transcribe_with_groq(wav_path, _retries=3, _timeout=3):
     with open(wav_path, "rb") as f:
         audio_data = f.read()
-    body = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="model"\r\n\r\n'
-        f"{GROQ_MODEL}\r\n"
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="language"\r\n\r\nen\r\n'
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="response_format"\r\n\r\nverbose_json\r\n'
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
-        f"Content-Type: audio/wav\r\n\r\n"
-    ).encode() + audio_data + f"\r\n--{boundary}--\r\n".encode()
-    ctx  = ssl.create_default_context()
-    conn = http.client.HTTPSConnection("api.groq.com", context=ctx)
-    conn.request("POST", "/openai/v1/audio/transcriptions", body=body, headers={
-        "Content-Type": f"multipart/form-data; boundary={boundary}",
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-    })
-    resp = conn.getresponse()
-    data = json.loads(resp.read())
-    conn.close()
-    segments = data.get("segments", [])
-    if segments:
-        avg_no_speech = sum(s.get("no_speech_prob", 0) for s in segments) / len(segments)
-        if avg_no_speech >= NO_SPEECH_THRESHOLD:
-            log.info(f"discarded: no_speech_prob={avg_no_speech:.2f}")
-            return ""
-    text = data.get("text", "").strip()
-    if filter_hallucinations and text.lower() in HALLUCINATION_EXACT:
-        log.info(f"discarded hallucination: {text!r}")
-        return ""
-    return text
+    for attempt in range(_retries):
+        try:
+            boundary = uuid.uuid4().hex
+            body = (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="model"\r\n\r\n'
+                f"{GROQ_MODEL}\r\n"
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="language"\r\n\r\nen\r\n'
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="response_format"\r\n\r\nverbose_json\r\n'
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
+                f"Content-Type: audio/wav\r\n\r\n"
+            ).encode() + audio_data + f"\r\n--{boundary}--\r\n".encode()
+            ctx  = ssl.create_default_context()
+            conn = http.client.HTTPSConnection("api.groq.com", context=ctx, timeout=_timeout)
+            conn.request("POST", "/openai/v1/audio/transcriptions", body=body, headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+            })
+            resp = conn.getresponse()
+            data = json.loads(resp.read())
+            conn.close()
+            segments = data.get("segments", [])
+            if segments:
+                avg_no_speech = sum(s.get("no_speech_prob", 0) for s in segments) / len(segments)
+                if avg_no_speech >= NO_SPEECH_THRESHOLD:
+                    log.info(f"discarded: no_speech_prob={avg_no_speech:.2f}")
+                    return ""
+            text = data.get("text", "").strip()
+            if filter_hallucinations and text.lower() in HALLUCINATION_EXACT:
+                log.info(f"discarded hallucination: {text!r}")
+                return ""
+            return text
+        except Exception as e:
+            log.warning(f"groq attempt {attempt+1}/{_retries} failed: {e}")
+    return ""
 
 # ── Parallel dictation engine ─────────────────────────────────────────────────
 
-def _process_chunk(seq, frames, win):
-    """Transcribe + format one chunk, post result to output queue."""
+def _process_chunk(seq, frames, win, out_q):
+    """Transcribe one chunk via Whisper and post result to output queue."""
     ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
     wav_path = os.path.join(AUDIO_DIR, f"{ts}_{seq:04d}.wav")
+    success = True
     try:
         with wave.open(wav_path, "wb") as wf:
             wf.setnchannels(1); wf.setsampwidth(2)
@@ -252,7 +321,7 @@ def _process_chunk(seq, frames, win):
         log.info(f"seq={seq} transcript={text!r}")
     except Exception as e:
         log.error(f"seq={seq} error={e}")
-        text = ""
+        text = ""; success = False
 
     raw = text.strip()
     formatted = raw
@@ -262,35 +331,48 @@ def _process_chunk(seq, frames, win):
         except Exception:
             pass
 
-    _out_q.put((seq, raw, formatted, win))
+    out_q.put((seq, raw, formatted, win, success))
 
-def _output_worker(start_seq):
-    """Drains _out_q in submission order regardless of completion order."""
-    pending  = {}
-    next_seq = start_seq
-    while dictation_active or not _out_q.empty() or pending:
+def _output_worker(start_seq, out_q):
+    """Drains out_q in submission order regardless of completion order."""
+    pending   = {}
+    next_seq  = start_seq
+    last_char = ""  # last char typed this session — used to stitch chunks without double spaces
+    while dictation_active or _pending_count > 0 or not out_q.empty() or pending:
         try:
-            seq, raw, formatted, win = _out_q.get(timeout=0.2)
+            seq, raw, formatted, win, success = out_q.get(timeout=0.2)
         except queue.Empty:
             continue
-        pending[seq] = (raw, formatted, win)
+        pending[seq] = (raw, formatted, win, success)
         while next_seq in pending:
-            raw, formatted, win = pending.pop(next_seq)
+            raw, formatted, win, success = pending.pop(next_seq)
             if formatted:
-                bridge.type_into_win.emit(formatted, win or "")
-                bridge.add_history.emit(raw, formatted)
-                _pending_remove(next_seq)  # success → drop from tray menu
+                text = formatted
+                if last_char and last_char not in (' ', '\n', '\t') and not text[0].isspace():
+                    text = ' ' + text
+                # Mid-sentence continuation: lowercase first char if previous chunk
+                # didn't end a sentence — Whisper always capitalises chunk-start words.
+                if last_char and last_char not in '.!?\n' and text[0].isupper():
+                    text = text[0].lower() + text[1:]
+                last_char = text[-1]
+                bridge.type_into_win.emit(text, win or "")
+                bridge.add_history.emit(raw, formatted, win or "")
+                _pending_remove(next_seq)
             else:
-                # Whisper returned empty — release the miniature so it doesn't
-                # linger on screen waiting for a type that will never happen.
                 bridge.mini_hide.emit()
+                last_char = ""
+                if success:
+                    _pending_remove(next_seq)  # filtered/empty — not an error, nothing to resend
+                # if not success: keep in pending — real API error, worth resending
             _dec_pending()
             next_seq += 1
 
 def dictation_loop():
     global recording, dictation_active, _seq, _parec_proc, _live_rms
+    log.info("dictation_loop: started")
     _seq = 0
-    threading.Thread(target=_output_worker, args=(_seq,), daemon=True).start()
+    _session_q = queue.Queue()
+    threading.Thread(target=_output_worker, args=(_seq, _session_q), daemon=True).start()
 
     env = {**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":0")}
     _parec_proc = subprocess.Popen(
@@ -299,15 +381,16 @@ def dictation_loop():
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env
     )
 
-    def _flush(buf, w, peak, sc, mini_f):
+    def _flush(buf, w, peak, sc, mini_f, final=False):
         global _seq
-        valid = peak >= MIN_SPEECH_RMS and sc >= MIN_SPEECH_CHUNKS and bool(buf)
+        # On final flush, skip MIN_SPEECH_CHUNKS — send whatever's left in buffer.
+        valid = peak >= MIN_SPEECH_RMS and bool(buf) and (final or sc >= MIN_SPEECH_CHUNKS)
         if mini_f and not valid:
             bridge.mini_hide.emit()
         if valid:
             seq = _seq; _seq += 1
             _inc_pending()
-            _executor.submit(_process_chunk, seq, list(buf), w)
+            _executor.submit(_process_chunk, seq, list(buf), w, _session_q)
 
     win           = get_focused_window()
     frames        = []
@@ -327,6 +410,8 @@ def dictation_loop():
         rms = math.sqrt(sum(s * s for s in samples) / len(samples)) if samples else 0
 
         if rms > SILENCE_THRESHOLD:
+            if not has_speech:
+                log.info(f"dictation_loop: speech detected rms={rms:.0f}")
             frames.append(data)
             has_speech    = True
             silent_chunks = 0
@@ -351,10 +436,15 @@ def dictation_loop():
                         desk  = subprocess.run(
                             ["xdotool", "get_desktop_for_window", w],
                             capture_output=True, text=True, timeout=1).stdout.strip()
+                        cur   = subprocess.run(
+                            ["xdotool", "get_desktop"],
+                            capture_output=True, text=True, timeout=1).stdout.strip()
                         ndesk = subprocess.run(
                             ["xdotool", "get_num_desktops"],
                             capture_output=True, text=True, timeout=1).stdout.strip()
-                        bridge.mini_show.emit(int(desk or 0), int(ndesk or 1), thumb)
+                        # Only show mini when target is on a different desktop
+                        if desk != cur:
+                            bridge.mini_show.emit(int(desk or 0), int(ndesk or 1), thumb)
                     except Exception as e:
                         log.error(f"mini setup error: {e}")
                 threading.Thread(target=_cap, daemon=True).start()
@@ -388,9 +478,9 @@ def dictation_loop():
         if total_chunks >= MAX_CHUNKS:
             break
 
-    # Flush any remaining speech
+    # Flush any remaining speech — final=True bypasses the min-duration filter
     if has_speech and frames:
-        _flush(frames, win, peak_rms, speech_chunks, mini_fired)
+        _flush(frames, win, peak_rms, speech_chunks, mini_fired, final=True)
 
     if _parec_proc:
         _parec_proc.terminate()
@@ -402,21 +492,30 @@ def dictation_loop():
 
 def on_toggle():
     global recording, dictation_active, _parec_proc, _pending_count
+    log.info(f"on_toggle: dictation_active={dictation_active} recording={recording}")
     if dictation_active:
         dictation_active = False
         if _parec_proc:
             _parec_proc.terminate()
         with _pending_lock:
             _pending_count = 0
+        with _pending_recs_lock:
+            _pending_recs.clear()
         bridge.queue_update.emit(0)
         bridge.update_ui.emit("idle", "Dictation OFF — click to start")
         bridge.update_subtitle.emit("")
+        # Force-clear any lingering miniature and drain the queue
+        _mini_queue.clear()
+        bridge.mini_hide.emit()
         return
     dictation_active = True
     if not recording:
         recording = True
+        log.info("on_toggle: starting dictation_loop thread")
         bridge.update_ui.emit("recording", "Listening…")
         threading.Thread(target=dictation_loop, daemon=True).start()
+    else:
+        log.warning(f"on_toggle: recording={recording} already True — loop already running?")
 
 # ── UI handlers ───────────────────────────────────────────────────────────────
 
@@ -428,6 +527,7 @@ def handle_update_subtitle(text):
     pass  # level meter now driven by QTimer — signal kept for compat
 
 def handle_type_into_win(text, win_id):
+    log.info(f"handle_type_into_win: text={text!r} win_id={win_id!r}")
     if not win_id:
         subprocess.run(
             ["xdotool", "type", "--clearmodifiers", "--delay", "0", "--", text],
@@ -443,16 +543,35 @@ def handle_type_into_win(text, win_id):
          "--delay", "0", "--", text],
         capture_output=True
     )
-    # Step 2: 3-2-1 countdown on the miniature, then teleport (if toggled on).
-    if restore_focus_on:
+    # Step 2: only show countdown+teleport if the target window is on a
+    # different virtual desktop — on the same desktop the mini is just noise.
+    same_desktop = True
+    try:
+        cur  = subprocess.run(["xdotool", "get_desktop"],
+                              capture_output=True, text=True, timeout=1).stdout.strip()
+        tgt  = subprocess.run(["xdotool", "get_desktop_for_window", win_id],
+                              capture_output=True, text=True, timeout=1).stdout.strip()
+        same_desktop = (cur == tgt)
+    except Exception:
+        pass
+
+    if restore_focus_on and not same_desktop:
         from PyQt5.QtCore import QTimer
+        global _countdown_id
+        _countdown_id += 1
+        my_id = _countdown_id
         def _tick(n):
+            if _countdown_id != my_id:
+                bridge.mini_hide.emit()
+                return
             bridge.mini_countdown.emit(n)
             if n > 1:
                 QTimer.singleShot(700, lambda: _tick(n - 1))
             else:
                 QTimer.singleShot(700, _teleport)
         def _teleport():
+            if _countdown_id != my_id:
+                return
             subprocess.run(["xdotool", "windowactivate", "--sync", win_id],
                            capture_output=True)
             bridge.mini_hide.emit()
@@ -460,12 +579,28 @@ def handle_type_into_win(text, win_id):
     else:
         bridge.mini_hide.emit()
 
-def handle_add_history(raw, formatted):
-    ts = datetime.now().strftime("%H:%M:%S")
-    history.append({"time": ts, "raw": raw, "formatted": formatted})
-    _save_history()
+def handle_add_history(raw, formatted, win):
+    now   = datetime.now()
+    ts    = now.strftime("%H:%M:%S")
+    epoch = now.timestamp()
+    # Group with the last entry if it targeted the same window within 5 s
+    if history and win:
+        last = history[-1]
+        if (last.get("win") == win and
+                epoch - last.get("ts_epoch", 0) <= HISTORY_GROUP_SECS):
+            last["raw"]      += " " + raw
+            last["formatted"] += " " + formatted
+            last["ts_epoch"]  = epoch
+            _mark_history_dirty()
+            if hist_panel.isVisible():
+                hist_panel.update_last_card(last)
+            return
+    entry = {"time": ts, "raw": raw, "formatted": formatted,
+             "win": win, "ts_epoch": epoch}
+    history.append(entry)
+    _mark_history_dirty()
     if hist_panel.isVisible():
-        hist_panel.prepend_card(history[-1])
+        hist_panel.prepend_card(entry)
 
 # ── Pending-recordings list (shown in tray menu, click to resend) ─────────────
 # A chunk is added the moment its WAV is saved, and removed once its text
@@ -474,7 +609,8 @@ _pending_recs      = []     # list of {"seq": int, "wav": path, "time": "HH:MM:S
 _pending_recs_lock = threading.Lock()
 
 def _pending_add(seq, wav_path):
-    rec = {"seq": seq, "wav": wav_path, "time": datetime.now().strftime("%H:%M:%S")}
+    now = datetime.now()
+    rec = {"seq": seq, "wav": wav_path, "time": now.strftime("%H:%M:%S"), "ts_epoch": now.timestamp()}
     with _pending_recs_lock:
         _pending_recs.append(rec)
 
@@ -500,7 +636,7 @@ def _resend_pending(seq, wav_path):
                 except Exception: pass
             if formatted:
                 bridge.type_into_win.emit(formatted, win or "")
-                bridge.add_history.emit(text, formatted)
+                bridge.add_history.emit(text, formatted, win or "")
                 _pending_remove(seq)
         except Exception as e:
             log.error(f"resend seq={seq} error: {e}")
@@ -511,6 +647,7 @@ def on_quit():
     dictation_active = False
     if _parec_proc:
         _parec_proc.terminate()
+    _flush_history()
     _executor.shutdown(wait=False)
     app.quit()
 
@@ -589,13 +726,13 @@ class SubtitleOverlay(QWidget):
             p.setBrush(QBrush(QColor(50, 200, 80, 210)))
             p.drawRoundedRect(x, 0, self._DOT_W, self._DOT_H, 2, 2)
 
-        # ── audio level bar (red, bottom row) ────────────────────────────────
+        # ── audio level bar (teal, bottom row) ───────────────────────────────
         bar_y = self._DOT_H + self._GAP
         p.setBrush(QBrush(QColor(0, 0, 0, 100)))
         p.drawRoundedRect(0, bar_y, self._W, self._BAR_H, 2, 2)
         if self._level:
             fill = int(self._W * self._level / self._MAX)
-            p.setBrush(QBrush(QColor(220, 50, 50, 210)))
+            p.setBrush(QBrush(QColor(0, 255, 212, 210)))
             p.drawRoundedRect(0, bar_y, fill, self._BAR_H, 2, 2)
 
         p.end()
@@ -661,6 +798,8 @@ class WindowMiniature(QWidget):
             if cur != self._current_desktop:
                 self._current_desktop = cur
                 self.update()
+                if hide_mini_on_switch and cur != self._desktop and self.isVisible():
+                    bridge.mini_hide.emit()
         except Exception:
             pass
 
@@ -831,6 +970,15 @@ class HistoryPanel(QWidget):
         self.cards_layout.insertWidget(0, self._make_card(entry))
         self.scroll.verticalScrollBar().setValue(0)
 
+    def update_last_card(self, entry):
+        """Rebuild the top card in-place (keeps copy button text current)."""
+        if self.cards_layout.count() > 1:
+            item = self.cards_layout.takeAt(0)
+            if item and item.widget():
+                item.widget().deleteLater()
+        self.cards_layout.insertWidget(0, self._make_card(entry))
+        self.scroll.verticalScrollBar().setValue(0)
+
     def rebuild(self):
         while self.cards_layout.count() > 1:
             item = self.cards_layout.takeAt(0)
@@ -857,30 +1005,141 @@ class HistoryPanel(QWidget):
         self.move(max(screen.left(), min(x, screen.right()-self.width())), max(screen.top(), y))
         self.show(); self.raise_()
 
+# ── Stream Settings Panel ────────────────────────────────────────────────────
+
+class StreamSettingsPanel(QWidget):
+    _SS = """
+    QWidget { background: #1e1e2e; color: #cdd6f4; }
+    QLabel  { font-size: 12px; }
+    QDoubleSpinBox {
+        background: #313244; border: 1px solid #45475a; border-radius: 4px;
+        padding: 2px 6px; color: #cdd6f4; font-size: 12px;
+    }
+    QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+        width: 16px; background: #45475a; border-radius: 2px;
+    }
+    QPushButton {
+        background: #313244; border: 1px solid #45475a; border-radius: 4px;
+        padding: 4px 14px; color: #cdd6f4; font-size: 12px;
+    }
+    QPushButton:hover  { background: #45475a; }
+    QPushButton:pressed { background: #585b70; }
+    QPushButton#save_ok { background: #40a02b; border-color: #40a02b; color: #fff; }
+    QPushButton#save_ok:hover { background: #4cc730; }
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("VoiceStream Settings")
+        self.setWindowFlags(Qt.Dialog | Qt.WindowStaysOnTopHint | Qt.WindowCloseButtonHint)
+        self.setStyleSheet(self._SS)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(10)
+
+        hdr = QLabel("Stream Timing")
+        hdr.setStyleSheet("font-weight: bold; font-size: 13px; color: #cdd6f4;")
+        root.addWidget(hdr)
+
+        self._force = self._row(root, "Force flush (s):",     STREAM_FORCE_FLUSH_SECS,   0.3, 8.0)
+        self._min   = self._row(root, "Min speech (s):",      STREAM_MIN_SPEECH_SECS,    0.2, 4.0)
+        self._sil   = self._row(root, "Silence trigger (s):", STREAM_SILENCE_FLUSH_SECS, 0.1, 2.0)
+
+        note = QLabel("Changes apply to the next chunk.")
+        note.setStyleSheet("color: #6c7086; font-size: 10px;")
+        root.addWidget(note)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self._save_btn = QPushButton("Save")
+        self._save_btn.setObjectName("save_ok")
+        self._save_btn.setFixedWidth(80)
+        self._save_btn.clicked.connect(self._save)
+        btn_row.addWidget(self._save_btn)
+        root.addLayout(btn_row)
+
+        self.adjustSize()
+        self.setFixedSize(self.size())
+
+    def _row(self, layout, label, value, lo, hi):
+        row = QHBoxLayout()
+        lbl = QLabel(label); lbl.setFixedWidth(155)
+        spin = QDoubleSpinBox()
+        spin.setRange(lo, hi); spin.setSingleStep(0.1)
+        spin.setDecimals(1);   spin.setValue(value)
+        spin.setFixedWidth(72)
+        spin.valueChanged.connect(self._apply)
+        row.addWidget(lbl); row.addWidget(spin); row.addStretch()
+        layout.addLayout(row)
+        return spin
+
+    def _apply(self):
+        global STREAM_FORCE_FLUSH_SECS, STREAM_MIN_SPEECH_SECS, STREAM_SILENCE_FLUSH_SECS
+        global STREAM_FORCE_CHUNKS, STREAM_MIN_SPEECH_CHUNKS, STREAM_SILENCE_CHUNKS
+        STREAM_FORCE_FLUSH_SECS   = self._force.value()
+        STREAM_MIN_SPEECH_SECS    = self._min.value()
+        STREAM_SILENCE_FLUSH_SECS = self._sil.value()
+        STREAM_FORCE_CHUNKS       = int(SAMPLE_RATE / CHUNK_SAMPLES * STREAM_FORCE_FLUSH_SECS)
+        STREAM_MIN_SPEECH_CHUNKS  = int(SAMPLE_RATE / CHUNK_SAMPLES * STREAM_MIN_SPEECH_SECS)
+        STREAM_SILENCE_CHUNKS     = int(SAMPLE_RATE / CHUNK_SAMPLES * STREAM_SILENCE_FLUSH_SECS)
+
+    def _save(self):
+        self._apply()
+        _save_settings()
+        self._save_btn.setText("Saved ✓")
+        QTimer.singleShot(1500, lambda: self._save_btn.setText("Save"))
+
+    def show_near_tray(self):
+        # Sync spinboxes to current globals (may have drifted from saved values)
+        for spin, val in [(self._force, STREAM_FORCE_FLUSH_SECS),
+                          (self._min,   STREAM_MIN_SPEECH_SECS),
+                          (self._sil,   STREAM_SILENCE_FLUSH_SECS)]:
+            spin.blockSignals(True)
+            spin.setValue(val)
+            spin.blockSignals(False)
+        geo = tray.geometry()
+        screen = QApplication.primaryScreen().availableGeometry()
+        if geo.width() == 0:
+            from PyQt5.QtGui import QCursor
+            cur = QCursor.pos()
+            x = cur.x() - self.width() // 2
+            y = cur.y() - self.height() - 6
+        else:
+            x = geo.x() + geo.width() // 2 - self.width() // 2
+            y = geo.y() - self.height() - 6
+        self.move(max(screen.left(), min(x, screen.right() - self.width())), max(screen.top(), y))
+        self.show(); self.raise_(); self.activateWindow()
+
 # ── App ───────────────────────────────────────────────────────────────────────
 
 app = QApplication(sys.argv)
 app.setQuitOnLastWindowClosed(False)
 
-subtitle   = SubtitleOverlay()
-hist_panel = HistoryPanel()
-mini       = WindowMiniature()
+subtitle       = SubtitleOverlay()
+hist_panel     = HistoryPanel()
+mini           = WindowMiniature()
+stream_settings = StreamSettingsPanel()
 
 bridge.update_ui.connect(handle_ui_update)
 bridge.update_subtitle.connect(handle_update_subtitle)
 bridge.type_into_win.connect(handle_type_into_win)
 bridge.add_history.connect(handle_add_history)
 bridge.queue_update.connect(subtitle.set_pending)
+
 # Mini queue: each chunk gets its own miniature, shown one at a time in order.
 # A new chunk's miniature waits until the current one's text has been typed
 # and its countdown+teleport finished (mini_hide fires). This way the arrow /
 # screenshot always represents the NEXT move, never overwritten mid-flight.
-_mini_queue  = []
-_mini_active = False
+_mini_queue    = []
+_mini_active   = False
+_countdown_id  = 0
 
 def _handle_mini_show(desktop, num_desktops, thumb):
     global _mini_active
+    if not mini_enabled:
+        return
     if _mini_active:
+        _mini_queue.clear()  # drop stale queued minis — only latest matters
         _mini_queue.append((desktop, num_desktops, thumb))
     else:
         _mini_active = True
@@ -904,6 +1163,16 @@ _level_timer = QTimer()
 _level_timer.setInterval(80)
 _level_timer.timeout.connect(lambda: subtitle.tick(_live_rms, _pending_count))
 _level_timer.start()
+
+_save_timer = QTimer()
+_save_timer.setInterval(5000)
+def _flush_history():
+    global _history_dirty
+    if _history_dirty:
+        _save_history()
+        _history_dirty = False
+_save_timer.timeout.connect(_flush_history)
+_save_timer.start()
 
 tray = QSystemTrayIcon(QIcon(make_pixmap("idle")), app)
 tray.setToolTip("Dictation OFF — click to start")
@@ -934,13 +1203,31 @@ def _rebuild_menu():
         global restore_focus_on
         restore_focus_on = not restore_focus_on
     rf.triggered.connect(_toggle_rf)
+    mn = menu.addAction("Window Preview")
+    mn.setCheckable(True); mn.setChecked(mini_enabled)
+    def _toggle_mini():
+        global mini_enabled
+        mini_enabled = not mini_enabled
+        if not mini_enabled:
+            _mini_queue.clear()
+            bridge.mini_hide.emit()
+    mn.triggered.connect(_toggle_mini)
+    ms = menu.addAction("Hide Preview on Desktop Switch")
+    ms.setCheckable(True); ms.setChecked(hide_mini_on_switch)
+    def _toggle_mini_switch():
+        global hide_mini_on_switch
+        hide_mini_on_switch = not hide_mini_on_switch
+    ms.triggered.connect(_toggle_mini_switch)
+    menu.addSeparator()
     menu.addAction("Show History").triggered.connect(hist_panel.show_near_tray)
+    menu.addAction("Stream Settings…").triggered.connect(stream_settings.show_near_tray)
 
     with _pending_recs_lock:
-        recs = list(_pending_recs)
+        now  = datetime.now().timestamp()
+        recs = [r for r in _pending_recs if now - r.get("ts_epoch", now) >= 5.0]
     if recs:
         menu.addSeparator()
-        hdr = menu.addAction("— Pending (click to resend) —")
+        hdr = menu.addAction("— Stuck (click to resend) —")
         hdr.setEnabled(False)
         for r in recs:
             seq = r["seq"]; wav = r["wav"]; t = r["time"]
@@ -956,7 +1243,7 @@ tray.setContextMenu(menu)
 tray.activated.connect(lambda r: on_toggle() if r == QSystemTrayIcon.Trigger else None)
 tray.show()
 
-# ── SIGUSR1 → toggle dictation (triggered by xbindkeys) ──────────────────────
+# ── SIGUSR1 → toggle dictation ────────────────────────────────────────────────
 def _on_sigusr1(signum, frame):
     QTimer.singleShot(0, on_toggle)
 
