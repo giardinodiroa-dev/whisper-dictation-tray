@@ -100,7 +100,7 @@ _play_proc          = None
 _ref_buf            = None   # latest ref chunk — written by drain thread, read by mix loop
 _ref_buf_lock       = threading.Lock()
 MONITOR_RATE        = 48000
-MONITOR_CHUNK       = 256
+MONITOR_CHUNK       = 128
 fx_pitch_up         = False   # chipmunk
 fx_pitch_down       = False   # deep voice
 fx_robot            = False   # ring modulation
@@ -115,6 +115,7 @@ def _load_history():
 def _load_settings():
     global STREAM_FORCE_FLUSH_SECS, STREAM_MIN_SPEECH_SECS, STREAM_SILENCE_FLUSH_SECS
     global STREAM_FORCE_CHUNKS, STREAM_MIN_SPEECH_CHUNKS, STREAM_SILENCE_CHUNKS
+    global monitor_volume, monitor_cancel, monitor_active
     try:
         with open(SETTINGS_PATH) as f:
             s = json.load(f)
@@ -124,6 +125,9 @@ def _load_settings():
         STREAM_FORCE_CHUNKS       = int(SAMPLE_RATE / CHUNK_SAMPLES * STREAM_FORCE_FLUSH_SECS)
         STREAM_MIN_SPEECH_CHUNKS  = int(SAMPLE_RATE / CHUNK_SAMPLES * STREAM_MIN_SPEECH_SECS)
         STREAM_SILENCE_CHUNKS     = int(SAMPLE_RATE / CHUNK_SAMPLES * STREAM_SILENCE_FLUSH_SECS)
+        monitor_volume            = int(s.get("mon_vol",    monitor_volume))
+        monitor_cancel            = int(s.get("mon_cancel", monitor_cancel))
+        monitor_active            = bool(s.get("mon_on",    False))
     except Exception:
         pass
 
@@ -131,9 +135,12 @@ def _save_settings():
     try:
         with open(SETTINGS_PATH, "w") as f:
             json.dump({
-                "force":   STREAM_FORCE_FLUSH_SECS,
-                "min":     STREAM_MIN_SPEECH_SECS,
-                "silence": STREAM_SILENCE_FLUSH_SECS,
+                "force":      STREAM_FORCE_FLUSH_SECS,
+                "min":        STREAM_MIN_SPEECH_SECS,
+                "silence":    STREAM_SILENCE_FLUSH_SECS,
+                "mon_vol":    monitor_volume,
+                "mon_cancel": monitor_cancel,
+                "mon_on":     monitor_active,
             }, f)
     except Exception as e:
         log.error(f"settings save error: {e}")
@@ -1226,10 +1233,12 @@ def toggle_hallucination_filter():
 def set_monitor_volume(vol_pct):
     global monitor_volume
     monitor_volume = vol_pct
+    _save_settings()
 
 def set_monitor_cancel(pct):
     global monitor_cancel
     monitor_cancel = pct
+    _save_settings()
 
 def _apply_effects(samples):
     global _robot_phase, _echo_buf
@@ -1336,7 +1345,7 @@ def _stop_monitor():
 def _start_monitor():
     global monitor_active, _mic_proc, _ref_proc, _play_proc
     env = {**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":0")}
-    common = [f"--rate={MONITOR_RATE}", "--channels=1", "--format=s16le", "--latency-msec=5"]
+    common = [f"--rate={MONITOR_RATE}", "--channels=1", "--format=s16le", "--latency-msec=1"]
 
     # Resolve actual monitor source name from default sink
     monitor_source = None
@@ -1369,6 +1378,7 @@ def toggle_monitor():
         _stop_monitor()
     else:
         _start_monitor()
+    _save_settings()
 
 # ── Hot auto-reload ───────────────────────────────────────────────────────────
 
@@ -1680,6 +1690,11 @@ def _on_tray_activated(reason):
 
 tray.activated.connect(_on_tray_activated)
 tray.show()
+
+# Restore monitor state from last session
+if monitor_active:
+    monitor_active = False   # _start_monitor sets it back to True
+    QTimer.singleShot(500, _start_monitor)
 
 if os.path.exists(_DEV_FLAG):
     enable_dev_reload()
