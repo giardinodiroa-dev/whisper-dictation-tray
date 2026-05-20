@@ -46,6 +46,11 @@ MAX_RECORD_SECS   = 600        # ~10 min hard cap — Groq's 25MB limit hits at 
 SAMPLE_RATE         = 16000
 GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL          = "whisper-large-v3-turbo"
+GROQ_MODELS         = [
+    ("Large V3 Turbo (fast)",    "whisper-large-v3-turbo"),
+    ("Large V3 (accurate)",      "whisper-large-v3"),
+    ("Distil V3 EN (fastest)",   "distil-whisper-large-v3-en"),
+]
 NO_SPEECH_THRESHOLD = 0.6   # discard if Whisper's avg no_speech_prob exceeds this
 HISTORY_GROUP_SECS  = 5.0   # chunks to the same window within this gap share one history card
 
@@ -94,6 +99,9 @@ monitor_ec_id       = None
 monitor_volume      = 100
 monitor_cancel      = 100   # % of PC audio to subtract from mic (0=off, 100=full, 150=overcorrect)
 monitor_denoise     = False
+monitor_accel       = False  # Acceleration: use module-loopback (native PA, no Python mix loop)
+_accel_module_id    = None   # pactl module index when accel is active
+_accel_sink_input   = None   # sink-input index for volume control in accel mode
 _mic_proc           = None
 _ref_proc           = None
 _play_proc          = None
@@ -115,7 +123,7 @@ def _load_history():
 def _load_settings():
     global STREAM_FORCE_FLUSH_SECS, STREAM_MIN_SPEECH_SECS, STREAM_SILENCE_FLUSH_SECS
     global STREAM_FORCE_CHUNKS, STREAM_MIN_SPEECH_CHUNKS, STREAM_SILENCE_CHUNKS
-    global monitor_volume, monitor_cancel, monitor_active
+    global monitor_volume, monitor_cancel, monitor_active, GROQ_MODEL
     try:
         with open(SETTINGS_PATH) as f:
             s = json.load(f)
@@ -128,6 +136,10 @@ def _load_settings():
         monitor_volume            = int(s.get("mon_vol",    monitor_volume))
         monitor_cancel            = int(s.get("mon_cancel", monitor_cancel))
         monitor_active            = bool(s.get("mon_on",    False))
+        monitor_accel             = bool(s.get("mon_accel", False))
+        saved_model = s.get("groq_model", GROQ_MODEL)
+        if any(m == saved_model for _, m in GROQ_MODELS):
+            GROQ_MODEL = saved_model
     except Exception:
         pass
 
@@ -141,6 +153,8 @@ def _save_settings():
                 "mon_vol":    monitor_volume,
                 "mon_cancel": monitor_cancel,
                 "mon_on":     monitor_active,
+                "mon_accel":  monitor_accel,
+                "groq_model": GROQ_MODEL,
             }, f)
     except Exception as e:
         log.error(f"settings save error: {e}")
@@ -1233,6 +1247,9 @@ def toggle_hallucination_filter():
 def set_monitor_volume(vol_pct):
     global monitor_volume
     monitor_volume = vol_pct
+    if monitor_accel and _accel_sink_input is not None:
+        subprocess.run(["pactl", "set-sink-input-volume",
+                        str(_accel_sink_input), f"{vol_pct}%"], capture_output=True)
     _save_settings()
 
 def set_monitor_cancel(pct):
@@ -1328,8 +1345,14 @@ def _mix_loop():
 
 def _stop_monitor():
     global monitor_active, _mic_proc, _ref_proc, _play_proc, monitor_module_id, monitor_ec_id, _ref_buf
+    global _accel_module_id, _accel_sink_input
     monitor_active = False
     _ref_buf = None
+    if _accel_module_id is not None:
+        subprocess.run(["pactl", "unload-module", str(_accel_module_id)], capture_output=True)
+        _accel_module_id = None
+        _accel_sink_input = None
+        return
     for p in (_mic_proc, _ref_proc, _play_proc):
         if p:
             try: p.terminate()
@@ -1343,7 +1366,53 @@ def _stop_monitor():
         monitor_ec_id = None
 
 def _start_monitor():
-    global monitor_active, _mic_proc, _ref_proc, _play_proc
+    global monitor_active, _mic_proc, _ref_proc, _play_proc, _accel_module_id, _accel_sink_input
+    if monitor_accel:
+        # Find the real hardware mic — default source may be a .monitor (output loopback)
+        # which would create an instant feedback loop. Explicitly pick a non-monitor source.
+        mic_source = None
+        try:
+            default_src = subprocess.run(["pactl", "get-default-source"],
+                                         capture_output=True, text=True).stdout.strip()
+            if not default_src.endswith(".monitor"):
+                mic_source = default_src
+            else:
+                sources = subprocess.run(["pactl", "list", "sources", "short"],
+                                         capture_output=True, text=True).stdout
+                for line in sources.splitlines():
+                    parts = line.split()
+                    if len(parts) > 1 and not parts[1].endswith(".monitor"):
+                        mic_source = parts[1]
+                        break
+        except Exception as e:
+            log.warning(f"accel: could not resolve mic source: {e}")
+        cmd = ["pactl", "load-module", "module-loopback", "latency_msec=1"]
+        if mic_source:
+            cmd.append(f"source={mic_source}")
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        _accel_module_id = r.stdout.strip()
+        log.info(f"monitor accel: loopback source={mic_source}")
+        # Find the sink-input created by this module for volume control
+        try:
+            info = subprocess.run(["pactl", "list", "sink-inputs"],
+                                  capture_output=True, text=True).stdout
+            _accel_sink_input = None
+            current_idx = None
+            for line in info.splitlines():
+                line = line.strip()
+                if line.startswith("Sink Input #"):
+                    current_idx = line.split("#")[1]
+                elif "Module:" in line and _accel_module_id and _accel_module_id in line:
+                    _accel_sink_input = current_idx
+        except Exception as e:
+            log.warning(f"accel: could not find sink-input: {e}")
+        # Apply saved volume immediately
+        if _accel_sink_input is not None:
+            subprocess.run(["pactl", "set-sink-input-volume",
+                            str(_accel_sink_input), f"{monitor_volume}%"], capture_output=True)
+        monitor_active = True
+        log.info(f"monitor accel: module={_accel_module_id} sink-input={_accel_sink_input}")
+        return
     env = {**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":0")}
     common = [f"--rate={MONITOR_RATE}", "--channels=1", "--format=s16le", "--latency-msec=1"]
 
@@ -1632,6 +1701,18 @@ def _rebuild_menu():
     mon = menu.addAction("Mic Monitor")
     mon.setCheckable(True); mon.setChecked(monitor_active)
     mon.triggered.connect(toggle_monitor)
+    acc = menu.addAction("  ⚡ Acceleration — silence only (no music)")
+    acc.setCheckable(True); acc.setChecked(monitor_accel)
+    def _toggle_accel():
+        global monitor_accel
+        was_active = monitor_active
+        if was_active:
+            _stop_monitor()
+        monitor_accel = not monitor_accel
+        _save_settings()
+        if was_active:
+            _start_monitor()
+    acc.triggered.connect(_toggle_accel)
     for i in range(len(menu._sliders)):
         a = QAction(" " * 30, menu); a.setObjectName(f"__slider_{i}")
         a.setEnabled(False); menu.addAction(a)
@@ -1647,6 +1728,16 @@ def _rebuild_menu():
     menu.addSeparator()
     menu.addAction("Show History").triggered.connect(hist_panel.show_near_tray)
     menu.addAction("Stream Settings…").triggered.connect(stream_settings.show_near_tray)
+    model_menu = menu.addMenu("  ◉ Whisper Model")
+    def _set_model(model_id):
+        global GROQ_MODEL
+        GROQ_MODEL = model_id
+        _save_settings()
+    for label, model_id in GROQ_MODELS:
+        a = model_menu.addAction(label)
+        a.setCheckable(True)
+        a.setChecked(GROQ_MODEL == model_id)
+        a.triggered.connect(lambda checked=False, m=model_id: _set_model(m))
 
     with _pending_recs_lock:
         now  = datetime.now().timestamp()
