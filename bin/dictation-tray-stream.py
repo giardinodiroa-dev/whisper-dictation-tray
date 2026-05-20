@@ -51,6 +51,21 @@ GROQ_MODELS         = [
     ("Large V3 (accurate)",      "whisper-large-v3"),
     ("Distil V3 EN (fastest)",   "distil-whisper-large-v3-en"),
 ]
+GROQ_LANGUAGE       = "en"   # empty string = Whisper auto-detect (may translate!)
+GROQ_LANGUAGES      = [
+    ("Auto-detect",  ""),
+    ("English",      "en"),
+    ("Spanish",      "es"),
+    ("French",       "fr"),
+    ("German",       "de"),
+    ("Italian",      "it"),
+    ("Portuguese",   "pt"),
+    ("Russian",      "ru"),
+    ("Japanese",     "ja"),
+    ("Chinese",      "zh"),
+    ("Arabic",       "ar"),
+    ("Hindi",        "hi"),
+]
 NO_SPEECH_THRESHOLD = 0.6   # discard if Whisper's avg no_speech_prob exceeds this
 HISTORY_GROUP_SECS  = 5.0   # chunks to the same window within this gap share one history card
 
@@ -123,7 +138,7 @@ def _load_history():
 def _load_settings():
     global STREAM_FORCE_FLUSH_SECS, STREAM_MIN_SPEECH_SECS, STREAM_SILENCE_FLUSH_SECS
     global STREAM_FORCE_CHUNKS, STREAM_MIN_SPEECH_CHUNKS, STREAM_SILENCE_CHUNKS
-    global monitor_volume, monitor_cancel, monitor_active, GROQ_MODEL
+    global monitor_volume, monitor_cancel, monitor_active, GROQ_MODEL, GROQ_LANGUAGE, restore_focus_on
     try:
         with open(SETTINGS_PATH) as f:
             s = json.load(f)
@@ -140,6 +155,10 @@ def _load_settings():
         saved_model = s.get("groq_model", GROQ_MODEL)
         if any(m == saved_model for _, m in GROQ_MODELS):
             GROQ_MODEL = saved_model
+        saved_lang = s.get("groq_language", GROQ_LANGUAGE)
+        if any(c == saved_lang for _, c in GROQ_LANGUAGES):
+            GROQ_LANGUAGE = saved_lang
+        restore_focus_on = bool(s.get("restore_focus", restore_focus_on))
     except Exception:
         pass
 
@@ -153,8 +172,10 @@ def _save_settings():
                 "mon_vol":    monitor_volume,
                 "mon_cancel": monitor_cancel,
                 "mon_on":     monitor_active,
-                "mon_accel":  monitor_accel,
-                "groq_model": GROQ_MODEL,
+                "mon_accel":    monitor_accel,
+                "groq_model":   GROQ_MODEL,
+                "groq_language": GROQ_LANGUAGE,
+                "restore_focus": restore_focus_on,
             }, f)
     except Exception as e:
         log.error(f"settings save error: {e}")
@@ -299,12 +320,16 @@ def transcribe_with_groq(wav_path, _retries=3, _timeout=3):
     for attempt in range(_retries):
         try:
             boundary = uuid.uuid4().hex
+            lang_part = (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="language"\r\n\r\n'
+                f"{GROQ_LANGUAGE}\r\n"
+            ) if GROQ_LANGUAGE else ""
             body = (
                 f"--{boundary}\r\n"
                 f'Content-Disposition: form-data; name="model"\r\n\r\n'
                 f"{GROQ_MODEL}\r\n"
-                f"--{boundary}\r\n"
-                f'Content-Disposition: form-data; name="language"\r\n\r\nen\r\n'
+                + lang_part +
                 f"--{boundary}\r\n"
                 f'Content-Disposition: form-data; name="response_format"\r\n\r\nverbose_json\r\n'
                 f"--{boundary}\r\n"
@@ -1682,6 +1707,7 @@ def _rebuild_menu():
     def _toggle_rf():
         global restore_focus_on
         restore_focus_on = not restore_focus_on
+        _save_settings()
     rf.triggered.connect(_toggle_rf)
     mn = menu.addAction("Window Preview")
     mn.setCheckable(True); mn.setChecked(mini_enabled)
@@ -1738,6 +1764,16 @@ def _rebuild_menu():
         a.setCheckable(True)
         a.setChecked(GROQ_MODEL == model_id)
         a.triggered.connect(lambda checked=False, m=model_id: _set_model(m))
+    lang_menu = menu.addMenu("  🌐 Language")
+    def _set_language(code):
+        global GROQ_LANGUAGE
+        GROQ_LANGUAGE = code
+        _save_settings()
+    for label, code in GROQ_LANGUAGES:
+        a = lang_menu.addAction(label)
+        a.setCheckable(True)
+        a.setChecked(GROQ_LANGUAGE == code)
+        a.triggered.connect(lambda checked=False, c=code: _set_language(c))
 
     with _pending_recs_lock:
         now  = datetime.now().timestamp()
