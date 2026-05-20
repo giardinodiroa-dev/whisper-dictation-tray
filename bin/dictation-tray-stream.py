@@ -101,7 +101,15 @@ STREAM_MIN_SPEECH_CHUNKS  = int(SAMPLE_RATE / CHUNK_SAMPLES * STREAM_MIN_SPEECH_
 STREAM_FORCE_CHUNKS       = int(SAMPLE_RATE / CHUNK_SAMPLES * STREAM_FORCE_FLUSH_SECS)
 STREAM_SILENCE_CHUNKS     = int(SAMPLE_RATE / CHUNK_SAMPLES * STREAM_SILENCE_FLUSH_SECS)
 
-ai_format             = False
+FORMAT_PROVIDER     = "off"        # "off", "groq", "ollama", "builtin"
+FORMAT_PROVIDERS    = [
+    ("Off",             "off"),
+    ("Groq (fastest)",  "groq"),
+    ("Ollama (local)",  "ollama"),
+    ("Built-in",        "builtin"),
+]
+GROQ_FORMAT_MODEL   = "llama-3.1-8b-instant"
+OLLAMA_FORMAT_MODEL = "qwen2.5:1.5b"
 filter_hallucinations = True
 restore_focus_on      = True   # when True, view auto-jumps to the window receiving text
 mini_enabled          = True   # when False, window preview miniature is suppressed
@@ -138,7 +146,7 @@ def _load_history():
 def _load_settings():
     global STREAM_FORCE_FLUSH_SECS, STREAM_MIN_SPEECH_SECS, STREAM_SILENCE_FLUSH_SECS
     global STREAM_FORCE_CHUNKS, STREAM_MIN_SPEECH_CHUNKS, STREAM_SILENCE_CHUNKS
-    global monitor_volume, monitor_cancel, monitor_active, GROQ_MODEL, GROQ_LANGUAGE, restore_focus_on
+    global monitor_volume, monitor_cancel, monitor_active, GROQ_MODEL, GROQ_LANGUAGE, restore_focus_on, FORMAT_PROVIDER
     try:
         with open(SETTINGS_PATH) as f:
             s = json.load(f)
@@ -159,6 +167,9 @@ def _load_settings():
         if any(c == saved_lang for _, c in GROQ_LANGUAGES):
             GROQ_LANGUAGE = saved_lang
         restore_focus_on = bool(s.get("restore_focus", restore_focus_on))
+        saved_fmt = s.get("format_provider", FORMAT_PROVIDER)
+        if any(p == saved_fmt for _, p in FORMAT_PROVIDERS):
+            FORMAT_PROVIDER = saved_fmt
     except Exception:
         pass
 
@@ -175,7 +186,8 @@ def _save_settings():
                 "mon_accel":    monitor_accel,
                 "groq_model":   GROQ_MODEL,
                 "groq_language": GROQ_LANGUAGE,
-                "restore_focus": restore_focus_on,
+                "restore_focus":   restore_focus_on,
+                "format_provider": FORMAT_PROVIDER,
             }, f)
     except Exception as e:
         log.error(f"settings save error: {e}")
@@ -289,30 +301,67 @@ def restore_focus(win_id):
         # the chunk back to its target window when typing completes.
         subprocess.run(["xdotool", "windowactivate", "--sync", win_id], capture_output=True)
 
-def _format(raw):
+_FORMAT_SYSTEM = (
+    "You are a speech-to-text post-processor. Your only job is to add punctuation "
+    "and fix capitalization. NEVER change, reorder, add, or remove any words — "
+    "preserve exactly what was said, even if it sounds unusual or incomplete. "
+    "Do not paraphrase, summarize, or correct meaning. "
+    "Return ONLY the formatted text with no explanations, comments, or quotes."
+)
+
+def _format_builtin(raw):
     body = json.dumps({
         "model": _d(_M),
-        "messages": [
-            {"role": "system", "content":
-                "You are a speech-to-text post-processor. Your only job is to add punctuation "
-                "and fix capitalization. NEVER change, reorder, add, or remove any words — "
-                "preserve exactly what was said, even if it sounds unusual or incomplete. "
-                "Do not paraphrase, summarize, or correct meaning. "
-                "Return ONLY the formatted text with no explanations, comments, or quotes."},
-            {"role": "user", "content": raw}
-        ],
-        "max_tokens": 2048,
+        "messages": [{"role": "system", "content": _FORMAT_SYSTEM},
+                     {"role": "user", "content": raw}],
+        "max_tokens": 512,
     }).encode()
     ctx  = ssl.create_default_context()
-    conn = http.client.HTTPSConnection(_d(_H), context=ctx)
+    conn = http.client.HTTPSConnection(_d(_H), context=ctx, timeout=8)
     conn.request("POST", _d(_P), body=body, headers={
         "Content-Type": "application/json",
         "Authorization": f"Bearer {_d(_AK)}",
     })
-    resp = conn.getresponse()
-    data = json.loads(resp.read())
+    data = json.loads(conn.getresponse().read())
     conn.close()
     return data["choices"][0]["message"]["content"].strip()
+
+def _format_groq(raw):
+    body = json.dumps({
+        "model": GROQ_FORMAT_MODEL,
+        "messages": [{"role": "system", "content": _FORMAT_SYSTEM},
+                     {"role": "user", "content": raw}],
+        "max_tokens": 512,
+    }).encode()
+    ctx  = ssl.create_default_context()
+    conn = http.client.HTTPSConnection("api.groq.com", context=ctx, timeout=6)
+    conn.request("POST", "/openai/v1/chat/completions", body=body, headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+    })
+    data = json.loads(conn.getresponse().read())
+    conn.close()
+    return data["choices"][0]["message"]["content"].strip()
+
+def _format_ollama(raw):
+    body = json.dumps({
+        "model": OLLAMA_FORMAT_MODEL,
+        "messages": [{"role": "system", "content": _FORMAT_SYSTEM},
+                     {"role": "user", "content": raw}],
+        "stream": False,
+    }).encode()
+    conn = http.client.HTTPConnection("localhost", 11434, timeout=10)
+    conn.request("POST", "/api/chat", body=body,
+                 headers={"Content-Type": "application/json"})
+    data = json.loads(conn.getresponse().read())
+    conn.close()
+    return data["message"]["content"].strip()
+
+def _format(raw):
+    if FORMAT_PROVIDER == "groq":    return _format_groq(raw)
+    if FORMAT_PROVIDER == "ollama":  return _format_ollama(raw)
+    if FORMAT_PROVIDER == "builtin": return _format_builtin(raw)
+    return raw
 
 def transcribe_with_groq(wav_path, _retries=3, _timeout=3):
     with open(wav_path, "rb") as f:
@@ -409,7 +458,7 @@ def _process_chunk(seq, frames, win, out_q):
 
     raw = text.strip()
     formatted = raw
-    if raw and ai_format:
+    if raw and FORMAT_PROVIDER != "off":
         try:
             formatted = _format(raw)
         except Exception:
@@ -715,7 +764,7 @@ def _resend_pending(seq, wav_path):
             text = transcribe_with_groq(wav_path).strip()
             log.info(f"resend seq={seq} transcript={text!r}")
             formatted = text
-            if text and ai_format:
+            if text and FORMAT_PROVIDER != "off":
                 try: formatted = _format(text)
                 except Exception: pass
             if formatted:
@@ -1261,10 +1310,6 @@ _save_timer.start()
 tray = QSystemTrayIcon(QIcon(make_pixmap("idle")), app)
 tray.setToolTip("Dictation OFF — click to start")
 
-def toggle_ai():
-    global ai_format
-    ai_format = not ai_format
-
 def toggle_hallucination_filter():
     global filter_hallucinations
     filter_hallucinations = not filter_hallucinations
@@ -1696,9 +1741,15 @@ def _rebuild_menu():
     """Rebuild on every right-click so the Pending section reflects current state."""
     menu.clear()
     menu.addAction("Toggle Dictation").triggered.connect(on_toggle)
-    fmt = menu.addAction("AI Formatting")
-    fmt.setCheckable(True); fmt.setChecked(ai_format)
-    fmt.triggered.connect(toggle_ai)
+    fmt_menu = menu.addMenu("  ✦ AI Format")
+    def _set_fmt(p):
+        global FORMAT_PROVIDER
+        FORMAT_PROVIDER = p
+        _save_settings()
+    for _lbl, _p in FORMAT_PROVIDERS:
+        _a = fmt_menu.addAction(_lbl)
+        _a.setCheckable(True); _a.setChecked(FORMAT_PROVIDER == _p)
+        _a.triggered.connect(lambda checked=False, p=_p: _set_fmt(p))
     hal = menu.addAction("Filter Thank Yous")
     hal.setCheckable(True); hal.setChecked(filter_hallucinations)
     hal.triggered.connect(toggle_hallucination_filter)
