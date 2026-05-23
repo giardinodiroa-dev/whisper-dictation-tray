@@ -1,0 +1,19 @@
+[Unit]
+Description=Focus capture daemon
+# Start after plasmashell is up; restart when it restarts
+After=app-plasmashell@.service plasma-kglobalaccel.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/CROWN/focus
+ExecStart=/usr/bin/python /home/CROWN/focus/daemon.py
+Restart=always
+RestartSec=2
+# Give plasmashell 3s to settle before we start
+ExecStartPre=/bin/sleep 3
+Environment=DISPLAY=:0
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+
+[Install]
+WantedBy=graphical-session.target
