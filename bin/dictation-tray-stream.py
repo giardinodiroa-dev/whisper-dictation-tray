@@ -94,8 +94,8 @@ CHUNK_BYTES    = CHUNK_SAMPLES * 2           # s16le = 2 bytes/sample
 SILENCE_CHUNKS = int(SAMPLE_RATE / CHUNK_SAMPLES * SILENCE_SECS)
 MAX_CHUNKS     = int(SAMPLE_RATE / CHUNK_SAMPLES * MAX_RECORD_SECS)
 
-STREAM_MIN_SPEECH_SECS   = 0.5   # minimum speech before a flush is eligible
-STREAM_FORCE_FLUSH_SECS  = 1.0   # force flush regardless of silence at this duration
+STREAM_MIN_SPEECH_SECS   = 0.3   # minimum speech before a flush is eligible
+STREAM_FORCE_FLUSH_SECS  = 4.0   # force flush regardless of silence at this duration
 STREAM_SILENCE_FLUSH_SECS = 0.3  # silence duration that triggers a flush (after min speech)
 STREAM_MIN_SPEECH_CHUNKS  = int(SAMPLE_RATE / CHUNK_SAMPLES * STREAM_MIN_SPEECH_SECS)
 STREAM_FORCE_CHUNKS       = int(SAMPLE_RATE / CHUNK_SAMPLES * STREAM_FORCE_FLUSH_SECS)
@@ -1237,7 +1237,7 @@ class StreamSettingsPanel(QWidget):
         NO_SPEECH_THRESHOLD       = self._trust.value()
 
     def _reset(self):
-        defaults = {"force": 1.0, "min": 0.5, "silence": 0.3, "trust": 0.8}
+        defaults = {"force": 4.0, "min": 0.3, "silence": 0.3, "trust": 0.8}
         for spin, key in [(self._force, "force"), (self._min, "min"),
                           (self._sil, "silence"), (self._trust, "trust")]:
             spin.blockSignals(True)
