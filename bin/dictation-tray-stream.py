@@ -66,7 +66,7 @@ GROQ_LANGUAGES      = [
     ("Arabic",       "ar"),
     ("Hindi",        "hi"),
 ]
-NO_SPEECH_THRESHOLD = 0.6   # discard if Whisper's avg no_speech_prob exceeds this
+NO_SPEECH_THRESHOLD = 0.8   # discard if Whisper's avg no_speech_prob exceeds this
 HISTORY_GROUP_SECS  = 5.0   # chunks to the same window within this gap share one history card
 
 HALLUCINATION_EXACT = {
@@ -147,6 +147,7 @@ def _load_settings():
     global STREAM_FORCE_FLUSH_SECS, STREAM_MIN_SPEECH_SECS, STREAM_SILENCE_FLUSH_SECS
     global STREAM_FORCE_CHUNKS, STREAM_MIN_SPEECH_CHUNKS, STREAM_SILENCE_CHUNKS
     global monitor_volume, monitor_cancel, monitor_active, GROQ_MODEL, GROQ_LANGUAGE, restore_focus_on, FORMAT_PROVIDER
+    global NO_SPEECH_THRESHOLD
     try:
         with open(SETTINGS_PATH) as f:
             s = json.load(f)
@@ -170,6 +171,7 @@ def _load_settings():
         saved_fmt = s.get("format_provider", FORMAT_PROVIDER)
         if any(p == saved_fmt for _, p in FORMAT_PROVIDERS):
             FORMAT_PROVIDER = saved_fmt
+        NO_SPEECH_THRESHOLD = float(s.get("trust_threshold", NO_SPEECH_THRESHOLD))
     except Exception:
         pass
 
@@ -188,6 +190,7 @@ def _save_settings():
                 "groq_language": GROQ_LANGUAGE,
                 "restore_focus":   restore_focus_on,
                 "format_provider": FORMAT_PROVIDER,
+                "trust_threshold": NO_SPEECH_THRESHOLD,
             }, f)
     except Exception as e:
         log.error(f"settings save error: {e}")
@@ -1179,11 +1182,25 @@ class StreamSettingsPanel(QWidget):
         self._min   = self._row(root, "Min speech (s):",      STREAM_MIN_SPEECH_SECS,    0.2, 4.0)
         self._sil   = self._row(root, "Silence trigger (s):", STREAM_SILENCE_FLUSH_SECS, 0.1, 2.0)
 
-        note = QLabel("Changes apply to the next chunk.")
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color: #45475a;")
+        root.addWidget(sep)
+
+        hdr2 = QLabel("Speech Filter")
+        hdr2.setStyleSheet("font-weight: bold; font-size: 13px; color: #cdd6f4;")
+        root.addWidget(hdr2)
+
+        self._trust = self._row(root, "Trust threshold:", NO_SPEECH_THRESHOLD, 0.0, 1.0, step=0.05, decimals=2)
+
+        note = QLabel("Higher = stricter (discard more silence/noise).\nChanges apply to the next chunk.")
         note.setStyleSheet("color: #6c7086; font-size: 10px;")
         root.addWidget(note)
 
         btn_row = QHBoxLayout()
+        self._reset_btn = QPushButton("Reset Defaults")
+        self._reset_btn.setFixedWidth(110)
+        self._reset_btn.clicked.connect(self._reset)
+        btn_row.addWidget(self._reset_btn)
         btn_row.addStretch()
         self._save_btn = QPushButton("Save")
         self._save_btn.setObjectName("save_ok")
@@ -1195,12 +1212,12 @@ class StreamSettingsPanel(QWidget):
         self.adjustSize()
         self.setFixedSize(self.size())
 
-    def _row(self, layout, label, value, lo, hi):
+    def _row(self, layout, label, value, lo, hi, step=0.1, decimals=1):
         row = QHBoxLayout()
         lbl = QLabel(label); lbl.setFixedWidth(155)
         spin = QDoubleSpinBox()
-        spin.setRange(lo, hi); spin.setSingleStep(0.1)
-        spin.setDecimals(1);   spin.setValue(value)
+        spin.setRange(lo, hi); spin.setSingleStep(step)
+        spin.setDecimals(decimals); spin.setValue(value)
         spin.setFixedWidth(72)
         spin.valueChanged.connect(self._apply)
         row.addWidget(lbl); row.addWidget(spin); row.addStretch()
@@ -1210,12 +1227,26 @@ class StreamSettingsPanel(QWidget):
     def _apply(self):
         global STREAM_FORCE_FLUSH_SECS, STREAM_MIN_SPEECH_SECS, STREAM_SILENCE_FLUSH_SECS
         global STREAM_FORCE_CHUNKS, STREAM_MIN_SPEECH_CHUNKS, STREAM_SILENCE_CHUNKS
+        global NO_SPEECH_THRESHOLD
         STREAM_FORCE_FLUSH_SECS   = self._force.value()
         STREAM_MIN_SPEECH_SECS    = self._min.value()
         STREAM_SILENCE_FLUSH_SECS = self._sil.value()
         STREAM_FORCE_CHUNKS       = int(SAMPLE_RATE / CHUNK_SAMPLES * STREAM_FORCE_FLUSH_SECS)
         STREAM_MIN_SPEECH_CHUNKS  = int(SAMPLE_RATE / CHUNK_SAMPLES * STREAM_MIN_SPEECH_SECS)
         STREAM_SILENCE_CHUNKS     = int(SAMPLE_RATE / CHUNK_SAMPLES * STREAM_SILENCE_FLUSH_SECS)
+        NO_SPEECH_THRESHOLD       = self._trust.value()
+
+    def _reset(self):
+        defaults = {"force": 1.0, "min": 0.5, "silence": 0.3, "trust": 0.8}
+        for spin, key in [(self._force, "force"), (self._min, "min"),
+                          (self._sil, "silence"), (self._trust, "trust")]:
+            spin.blockSignals(True)
+            spin.setValue(defaults[key])
+            spin.blockSignals(False)
+        self._apply()
+        _save_settings()
+        self._reset_btn.setText("Reset ✓")
+        QTimer.singleShot(1500, lambda: self._reset_btn.setText("Reset Defaults"))
 
     def _save(self):
         self._apply()
@@ -1227,7 +1258,8 @@ class StreamSettingsPanel(QWidget):
         # Sync spinboxes to current globals (may have drifted from saved values)
         for spin, val in [(self._force, STREAM_FORCE_FLUSH_SECS),
                           (self._min,   STREAM_MIN_SPEECH_SECS),
-                          (self._sil,   STREAM_SILENCE_FLUSH_SECS)]:
+                          (self._sil,   STREAM_SILENCE_FLUSH_SECS),
+                          (self._trust, NO_SPEECH_THRESHOLD)]:
             spin.blockSignals(True)
             spin.setValue(val)
             spin.blockSignals(False)
