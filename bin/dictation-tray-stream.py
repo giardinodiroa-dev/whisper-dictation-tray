@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, os, signal, subprocess, threading, json, http.client, ssl, logging
+import sys, os, signal, subprocess, threading, json, http.client, ssl, logging, time
 import struct, math, wave, tempfile, uuid, queue, concurrent.futures
 from datetime import datetime
 
@@ -618,12 +618,29 @@ def dictation_loop():
     if has_speech and frames:
         _flush(frames, win, peak_rms, speech_chunks, mini_fired, final=True)
 
+    parec_died = _parec_proc and _parec_proc.poll() is not None
     if _parec_proc:
         _parec_proc.terminate()
-        _parec_proc.wait()
+        try: _parec_proc.wait(timeout=1)
+        except Exception: pass
     _parec_proc = None
     _live_rms   = 0
+
+    # If parec died on its own while we were still supposed to be recording,
+    # auto-restart so the user doesn't have to click twice to recover.
+    if dictation_active and parec_died:
+        log.warning("dictation_loop: parec died unexpectedly — restarting in 1s")
+        recording = False
+        bridge.update_ui.emit("idle", "Reconnecting…")
+        time.sleep(1.0)
+        if dictation_active:  # user may have toggled off during the sleep
+            recording = True
+            bridge.update_ui.emit("recording", "Listening…")
+            threading.Thread(target=dictation_loop, daemon=True).start()
+        return
+
     recording   = False
+    dictation_active = False
     bridge.update_ui.emit("idle", "Dictation OFF — click to start")
 
 def on_toggle():
